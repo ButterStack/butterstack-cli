@@ -1,0 +1,757 @@
+#!/usr/bin/env node
+
+/**
+ * ButterStack CLI (butter)
+ * Fast, scriptable, zero-dependency command line interface for the ButterStack game development pipeline.
+ */
+
+const http = require("http");
+const https = require("https");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { spawn } = require("child_process");
+
+const CONFIG_DIR = path.join(os.homedir(), ".config", "butterstack");
+const CREDS_FILE = path.join(CONFIG_DIR, "credentials.json");
+const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+
+// Read once at startup so the User-Agent (and any future version reporting)
+// always matches what's actually installed, rather than a string that has
+// to be remembered and bumped by hand every release.
+const PACKAGE_JSON = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf-8"));
+const CLI_VERSION = PACKAGE_JSON.version;
+
+// ANSI Color Tokens (Aligned with ButterStack Design System)
+const colors = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  accent: "\x1b[38;2;56;189;248m",   // #38bdf8
+  ok: "\x1b[38;2;74;222;128m",       // #4ade80
+  warn: "\x1b[38;2;251;191;36m",     // #fbbf24
+  err: "\x1b[38;2;248;113;113m",     // #f87171
+  muted: "\x1b[38;2;148;163;184m",   // #94a3b8
+  bgPanel: "\x1b[48;2;30;41;59m"     // #1e293b
+};
+
+// Set once in main() from the parsed top-level argv. Every command handler
+// already takes its own `args`, but request()/getHost() are called from
+// deep inside promise callbacks (e.g. the OAuth loopback handler) where
+// threading `args` through every call site would be a much larger diff for
+// no behavior difference -- there is exactly one CLI invocation per
+// process, so one module-scoped copy of its args is unambiguous.
+let cliArgs = {};
+
+// Precedence: --host flag > BUTTERSTACK_HOST env > config.json (`butter
+// auth login --host ...` persists here) > the host recorded in
+// credentials.json at the last successful login > the production default.
+// `--host` and `BUTTERSTACK_HOST` must always be fully honored, not merely
+// parsed: a flag that's accepted on the command line but silently ignored
+// is worse than no flag at all, because it lets a stored credential get
+// attached to a request that the caller believed was going somewhere else
+// entirely.
+function getHost() {
+  const flagHost = cliArgs && typeof cliArgs.host === "string" ? cliArgs.host : null;
+  const storedCreds = loadCredentials();
+  const resolved =
+    flagHost ||
+    process.env.BUTTERSTACK_HOST ||
+    loadConfig().host ||
+    (storedCreds && storedCreds.host) ||
+    "https://www.butterstack.com";
+  return resolved.replace(/\/$/, "");
+}
+
+function loadConfig() {
+  if (fs.existsSync(CONFIG_FILE)) {
+    try {
+      return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf-8"));
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function saveConfig(cfg) {
+  if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+}
+
+function loadCredentials() {
+  if (process.env.BUTTERSTACK_API_TOKEN) {
+    return { token: process.env.BUTTERSTACK_API_TOKEN, source: "env" };
+  }
+  if (fs.existsSync(CREDS_FILE)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(CREDS_FILE, "utf-8"));
+      return { ...data, source: "file" };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function saveCredentials(creds) {
+  if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(CREDS_FILE, JSON.stringify(creds, null, 2), { mode: 0o600 });
+}
+
+function clearCredentials() {
+  if (fs.existsSync(CREDS_FILE)) fs.unlinkSync(CREDS_FILE);
+}
+
+function openBrowser(url) {
+  // spawn with an argument array, not a shell string built via exec(): the
+  // URL is host-derived (--host / BUTTERSTACK_HOST / config), so a malicious
+  // or malformed host value can never be interpreted by a shell, only
+  // passed as a literal argv entry to the "open" helper -- and there's no
+  // reason to interpolate into a shell command when an argv array costs
+  // nothing.
+  const start = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+  const child = spawn(start, [url], { stdio: "ignore", shell: process.platform === "win32" });
+  child.on("error", () => {
+    console.log(`\n${colors.warn}! Could not automatically open browser.${colors.reset}`);
+    console.log(`Please visit this URL to authenticate:\n  ${colors.accent}${url}${colors.reset}\n`);
+  });
+}
+
+// `opts.noAuth` is used only by the login exchange call below: that request
+// is *establishing* credentials for `host`, so it must never attach (or
+// host-check against) whatever unrelated credential happens to already be
+// on disk for a different host.
+function request(method, endpoint, body = null, tokenOverride = null, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const host = getHost();
+    const creds = opts.noAuth ? null : loadCredentials();
+    const token = opts.noAuth ? null : tokenOverride || (creds ? creds.token : null);
+
+    // Refuse to silently send a stored credential to a host it wasn't
+    // minted for. This is the core protection here, not just making --host
+    // work: a credential file written by `butter auth login --host
+    // https://www.butterstack.com` must never go out over a request that
+    // resolved to some other host (e.g. a bare `butter` invocation that
+    // fell back to a different default because an env var wasn't set, or a
+    // flag was mistyped). Without this check, a host-resolution bug
+    // anywhere upstream turns into a silent credential leak to the wrong
+    // server instead of a loud, obvious error. An explicit --token override
+    // bypasses this (the caller supplied that token directly, not the
+    // file), and skipping when there IS no token at all is correct: an
+    // unauthenticated request has nothing to leak.
+    if (!opts.noAuth && !tokenOverride && token && creds && creds.source === "file" && creds.host) {
+      const credHost = String(creds.host).replace(/\/$/, "");
+      if (credHost !== host) {
+        const err = new Error(
+          `Refusing to send the stored credential (minted for ${credHost}) to ${host}. ` +
+            `Pass --host ${credHost} (or unset BUTTERSTACK_HOST) to target the account this token belongs to, ` +
+            `or run \`butter auth login --host ${host}\` to get a token for this host.`
+        );
+        err.code = "HOST_MISMATCH";
+        reject(err);
+        return;
+      }
+    }
+
+    const url = new URL(endpoint.startsWith("http") ? endpoint : `${host}${endpoint}`);
+    const isHttps = url.protocol === "https:";
+    const client = isHttps ? https : http;
+
+    const headers = {
+      Accept: "application/json",
+      "User-Agent": `butter-cli/${CLI_VERSION} (${os.platform()}; ${os.arch()})`
+    };
+
+    if (token) {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+
+    let payload = null;
+    if (body) {
+      payload = typeof body === "string" ? body : JSON.stringify(body);
+      headers["Content-Type"] = "application/json";
+      headers["Content-Length"] = Buffer.byteLength(payload);
+    }
+
+    const req = client.request(
+      url,
+      {
+        method,
+        headers
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          let parsed;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            parsed = data;
+          }
+
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(parsed);
+          } else {
+            const err = new Error(
+              parsed && parsed.message ? parsed.message : parsed && parsed.error ? parsed.error : `HTTP ${res.statusCode}`
+            );
+            err.statusCode = res.statusCode;
+            err.response = parsed;
+            reject(err);
+          }
+        });
+      }
+    );
+
+    req.on("error", reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+// CLI Command Handlers
+// Least-privilege presets for `butter auth login --scope <name>`. Named
+// bundles cover the common "I only need X" case without making every
+// caller memorize the raw permission strings; `--scope` also accepts a
+// raw comma/space-separated permission list directly (passed through
+// as-is, validated server-side against the CLI-eligible scope set).
+const SCOPE_PRESETS = {
+  "read-only": "read:projects read:tasks read:builds read:assets",
+  full: "" // empty scope param -> server defaults to the full CLI set
+};
+
+async function authLogin(args) {
+  const host = getHost();
+  console.log(`${colors.accent}${colors.bold}ButterStack Authentication${colors.reset}`);
+  console.log(`${colors.muted}Connecting to ${host}...${colors.reset}\n`);
+
+  // No --scope -> omit the param entirely so the server keeps defaulting to
+  // the full CLI set (unchanged behavior for a plain `butter auth login`).
+  // A named preset or an explicit raw list narrows what gets requested --
+  // e.g. a CI credential minted with `--scope read-only` never carries
+  // write:assets/write:builds/write:tasks, which matters because a token
+  // that ends up on a CI runner or in a script is more exposed than one
+  // that lives only in a developer's own credential store.
+  let requestedScope = null;
+  if (args.scope) {
+    requestedScope = SCOPE_PRESETS[args.scope] !== undefined ? SCOPE_PRESETS[args.scope] : args.scope.replace(/,/g, " ");
+  }
+
+  const codeVerifier = crypto.randomBytes(32).toString("hex");
+  // digest("base64url") is the real syntax floor for this CLI: it needs
+  // Node >=14.18.0. The "engines" field in package.json declares a higher
+  // floor (>=18) as a support policy, not because anything below that
+  // fails to run -- do not lower "engines" on the theory that this line
+  // would still work on 14.x; the policy floor and the syntax floor are
+  // tracked separately on purpose.
+  const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+  const state = crypto.randomBytes(16).toString("hex");
+
+  const server = http.createServer(async (req, res) => {
+    const reqUrl = new URL(req.url || "/", `http://${req.headers.host}`);
+    if (reqUrl.pathname !== "/callback") {
+      res.writeHead(404);
+      res.end("Not Found");
+      return;
+    }
+
+    const returnedState = reqUrl.searchParams.get("state");
+    const authCode = reqUrl.searchParams.get("code");
+
+    if (returnedState !== state || !authCode) {
+      res.writeHead(400, { "Content-Type": "text/html" });
+      res.end("<h3>Authentication Failed: Invalid State</h3>");
+      server.close();
+      console.error(`${colors.err}✗ Authentication failed: State mismatch or missing code.${colors.reset}`);
+      process.exit(1);
+    }
+
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>ButterStack Authorization</title>
+          <style>
+            body { background: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; height: 100vh; align-items: center; justify-content: center; margin: 0; }
+            .card { background: #1e293b; padding: 2.5rem; border-radius: 16px; border: 1px solid #334155; text-align: center; max-width: 420px; box-shadow: 0 20px 30px rgba(0,0,0,0.4); }
+            h2 { color: #38bdf8; margin: 0 0 0.5rem 0; font-size: 1.5rem; }
+            p { color: #94a3b8; font-size: 0.95rem; line-height: 1.5; margin: 0.5rem 0; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <h2>✓ Authentication Complete!</h2>
+            <p>You have successfully authorized the ButterStack CLI.</p>
+            <p>You can close this tab and return to your terminal.</p>
+          </div>
+        </body>
+      </html>
+    `);
+
+    server.close();
+
+    try {
+      console.log(`${colors.muted}Exchanging authorization code for API token...${colors.reset}`);
+      // noAuth: this call is establishing a credential for `host` -- it
+      // must never attach (or get blocked by the host-binding check for)
+      // some unrelated token that's already on disk for a different host.
+      const exchange = await request(
+        "POST",
+        "/api/v1/cli/token_exchange",
+        {
+          code: authCode,
+          code_verifier: codeVerifier,
+          device_name: `${os.hostname()} (${os.platform()})`
+        },
+        null,
+        { noAuth: true }
+      );
+
+      // The server is expected to derive the grant from what it bound at
+      // GET time, not from anything the browser POSTs -- but the CLI
+      // should still refuse to adopt a credential broader than what it
+      // asked for rather than silently trusting the response, in case a
+      // server-side bug, a proxy, or a browser extension ever alters the
+      // exchange in flight. A credential granted more than requested is a
+      // silent privilege escalation if it's just accepted and saved.
+      if (requestedScope) {
+        const requested = new Set(requestedScope.split(/\s+/).filter(Boolean));
+        const granted = Array.isArray(exchange.scopes) ? exchange.scopes : [];
+        const unexpected = granted.filter((s) => !requested.has(s));
+        if (unexpected.length > 0) {
+          console.error(
+            `${colors.err}✗ Refusing to store this credential: it was granted ${unexpected.join(", ")}, ` +
+              `which was not part of the requested scope (${[...requested].join(", ")}).${colors.reset}`
+          );
+          console.error(`${colors.err}This should never happen; please report it.${colors.reset}`);
+          process.exit(1);
+        }
+      }
+
+      saveCredentials({
+        token: exchange.token,
+        actor: exchange.actor,
+        scopes: exchange.scopes,
+        host: host,
+        createdAt: exchange.created_at,
+        expiresAt: exchange.expires_at
+      });
+
+      // Persist the host that was actually used for this login as the new
+      // default, so a later invocation with neither --host nor
+      // BUTTERSTACK_HOST still targets the account this token belongs to
+      // instead of falling back to the production default.
+      saveConfig({ ...loadConfig(), host });
+
+      console.log(`${colors.ok}✓ Successfully authenticated as ${colors.bold}${exchange.actor.email}${colors.reset}`);
+      console.log(`${colors.muted}Scopes: ${exchange.scopes.join(", ")}${colors.reset}`);
+      if (exchange.expires_at) {
+        console.log(`${colors.muted}Token expires ${new Date(exchange.expires_at).toLocaleDateString()} -- run ${colors.bold}butter auth login${colors.reset}${colors.muted} again after that to renew.${colors.reset}`);
+      }
+      console.log("");
+      process.exit(0);
+    } catch (err) {
+      console.error(`${colors.err}✗ Token exchange failed: ${err.message}${colors.reset}`);
+      process.exit(1);
+    }
+  });
+
+  // Deliberately bound to the loopback interface, not "0.0.0.0" or left
+  // unspecified: the OAuth callback carries the authorization code, and
+  // binding to 127.0.0.1 means only a process on this same machine can
+  // ever reach it. Widening this to listen on all interfaces would expose
+  // the callback (and, transitively, the auth flow) to anything else on
+  // the local network. Do not "fix" this to a wildcard bind.
+  server.listen(0, "127.0.0.1", () => {
+    const address = server.address();
+    const port = address.port;
+    let authUrl = `${host}/cli/auth?port=${port}&state=${state}&code_challenge=${codeChallenge}&client_name=ButterStack+CLI`;
+    if (requestedScope) {
+      authUrl += `&scope=${encodeURIComponent(requestedScope)}`;
+    }
+
+    console.log(`Opening your browser for one-click authorization...`);
+    console.log(`${colors.dim}URL: ${authUrl}${colors.reset}\n`);
+    openBrowser(authUrl);
+  });
+}
+
+// Tokens minted via the browser loopback flow carry a 90-day expires_at --
+// surface how much runway is left so a caller finds out from `whoami`,
+// not from a 401 mid-script.
+const RENEWAL_WARNING_WINDOW_DAYS = 7;
+
+async function authWhoami(args) {
+  const creds = loadCredentials();
+
+  try {
+    const ctx = await request("GET", "/api/v1/auth/context");
+    if (args.json) {
+      console.log(JSON.stringify({ ...ctx, expires_at: creds && creds.expiresAt }, null, 2));
+      return;
+    }
+    console.log(`\n${colors.bold}ButterStack Identity:${colors.reset}`);
+    console.log(`  Account ID: ${colors.accent}${ctx.account_id || "Personal"}${colors.reset}`);
+    console.log(`  Actor Type: ${ctx.actor_type}`);
+    console.log(`  Scopes:     ${colors.ok}${(ctx.scopes || []).join(", ")}${colors.reset}`);
+    console.log(`  Host:       ${getHost()}`);
+
+    if (creds && creds.expiresAt) {
+      const daysLeft = Math.ceil((new Date(creds.expiresAt).getTime() - Date.now()) / (24 * 60 * 60 * 1000));
+      console.log(`  Expires:    ${colors.muted}${new Date(creds.expiresAt).toLocaleDateString()} (${daysLeft} day${daysLeft === 1 ? "" : "s"})${colors.reset}`);
+      if (daysLeft <= RENEWAL_WARNING_WINDOW_DAYS) {
+        console.log(`  ${colors.warn}! Expiring soon -- run ${colors.bold}butter auth login${colors.reset}${colors.warn} to renew.${colors.reset}`);
+      }
+    }
+    console.log("");
+  } catch (err) {
+    console.error(`${colors.err}✗ Not authenticated or invalid token: ${err.message}${colors.reset}`);
+    console.error(`Run ${colors.bold}butter auth login${colors.reset} to log in.`);
+    process.exit(1);
+  }
+}
+
+async function authLogout() {
+  clearCredentials();
+  console.log(`${colors.ok}✓ Successfully logged out.${colors.reset}`);
+}
+
+async function projectsList(args) {
+  try {
+    const res = await request("GET", "/api/v1/projects");
+    if (args.json) {
+      console.log(JSON.stringify(res.projects, null, 2));
+      return;
+    }
+    console.log(`\n${colors.bold}PROJECTS (${res.projects.length})${colors.reset}`);
+    console.log("----------------------------------------------------------------------");
+    res.projects.forEach((p) => {
+      console.log(
+        `  ${colors.bold}${p.id.toString().padEnd(6)}${colors.reset} ${colors.accent}${p.name.padEnd(25)}${colors.reset} [${p.project_type}] ${colors.muted}Tasks: ${p.tasks_count} | Builds: ${p.build_runs_count} | Assets: ${p.assets_count}${colors.reset}`
+      );
+    });
+    console.log("");
+  } catch (err) {
+    console.error(`${colors.err}✗ Failed to list projects: ${err.message}${colors.reset}`);
+    process.exit(1);
+  }
+}
+
+async function tasksList(args) {
+  const projectId = args.project || loadConfig().defaultProject;
+  if (!projectId) {
+    console.error(`${colors.err}✗ Missing project ID. Use --project <id> or set default in config.${colors.reset}`);
+    process.exit(1);
+  }
+
+  const query = new URLSearchParams();
+  if (args.state) query.set("state", args.state);
+  if (args.type) query.set("task_type", args.type);
+  if (args.priority) query.set("priority", args.priority);
+  if (args.assignee) query.set("assignee", args.assignee);
+  if (args.limit) query.set("limit", args.limit);
+
+  try {
+    const res = await request("GET", `/api/v1/projects/${projectId}/tasks?${query.toString()}`);
+    if (args.json) {
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+    console.log(`\n${colors.bold}TASKS for Project #${projectId} (${res.tasks.length})${colors.reset}`);
+    console.log("----------------------------------------------------------------------");
+    res.tasks.forEach((t) => {
+      const stateColor = t.state === "completed" ? colors.ok : t.state === "blocked" ? colors.err : colors.warn;
+      console.log(
+        `  #${t.id.toString().padEnd(5)} ${stateColor}[${t.state}]${colors.reset} ${colors.accent}[${t.task_type || "task"}]${colors.reset} ${t.title} ${colors.muted}(${t.priority || "normal"})${colors.reset}`
+      );
+    });
+    console.log("");
+  } catch (err) {
+    console.error(`${colors.err}✗ Failed to list tasks: ${err.message}${colors.reset}`);
+    process.exit(1);
+  }
+}
+
+async function tasksCreate(args) {
+  const projectId = args.project || loadConfig().defaultProject;
+  const title = args._[2];
+  if (!projectId || !title) {
+    console.error(`${colors.err}✗ Usage: butter tasks create "<title>" --project <id> [--type <type>] [--priority <priority>]${colors.reset}`);
+    process.exit(1);
+  }
+
+  try {
+    const res = await request("POST", `/api/v1/projects/${projectId}/tasks`, {
+      task: {
+        title: title,
+        task_type: args.type || "chore",
+        priority: args.priority || "medium",
+        state: args.state || "to_do",
+        description: args.description || "",
+        assignee_handle: args.assignee || null
+      }
+    });
+
+    if (args.json) {
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+    console.log(`${colors.ok}✓ Created Task #${res.id}:${colors.reset} ${colors.bold}${res.title}${colors.reset}`);
+  } catch (err) {
+    console.error(`${colors.err}✗ Failed to create task: ${err.message}${colors.reset}`);
+    process.exit(1);
+  }
+}
+
+async function buildsList(args) {
+  const projectId = args.project || loadConfig().defaultProject;
+  if (!projectId) {
+    console.error(`${colors.err}✗ Missing project ID. Use --project <id>${colors.reset}`);
+    process.exit(1);
+  }
+
+  const query = new URLSearchParams();
+  if (args.status) query.set("status", args.status);
+  if (args.type) query.set("build_type", args.type);
+  if (args.limit) query.set("limit", args.limit || "10");
+
+  try {
+    const res = await request("GET", `/api/v1/projects/${projectId}/build_runs?${query.toString()}`);
+    if (args.json) {
+      console.log(JSON.stringify(res.build_runs, null, 2));
+      return;
+    }
+    console.log(`\n${colors.bold}BUILDS for Project #${projectId} (${res.build_runs.length})${colors.reset}`);
+    console.log("----------------------------------------------------------------------");
+    res.build_runs.forEach((b) => {
+      const statusColor = b.status === "completed" ? colors.ok : b.status === "failed" ? colors.err : colors.warn;
+      console.log(
+        `  Build #${b.id.toString().padEnd(5)} ${statusColor}[${b.status.toUpperCase()}]${colors.reset} ${b.build_type || "build"} ${colors.muted}${b.commit_hash ? `@${b.commit_hash}` : ""} (${b.duration ? b.duration + "s" : ""})${colors.reset}`
+      );
+    });
+    console.log("");
+  } catch (err) {
+    console.error(`${colors.err}✗ Failed to list builds: ${err.message}${colors.reset}`);
+    process.exit(1);
+  }
+}
+
+async function buildsInvestigate(args) {
+  const projectId = args.project || loadConfig().defaultProject;
+  const buildId = args._[2];
+  if (!projectId || !buildId) {
+    console.error(`${colors.err}✗ Usage: butter builds investigate <build_id> --project <id>${colors.reset}`);
+    process.exit(1);
+  }
+
+  try {
+    console.log(`${colors.accent}Triggering AI Failure Investigation for Build #${buildId}...${colors.reset}`);
+    const res = await request("POST", `/api/v1/projects/${projectId}/build_runs/${buildId}/investigate`);
+    if (args.json) {
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+    console.log(`\n${colors.bold}AI Failure Investigation Report:${colors.reset}`);
+    console.log(`  Status:      ${colors.ok}${res.status}${colors.reset}`);
+    console.log(`  Diagnosis:   ${res.diagnosis || res.summary || "Pending analysis..."}`);
+    if (res.suggested_fix) console.log(`  Fix:         ${colors.accent}${res.suggested_fix}${colors.reset}`);
+    if (res.attributed_author) console.log(`  Attributed:  ${res.attributed_author}`);
+    console.log("");
+  } catch (err) {
+    console.error(`${colors.err}✗ Failed to investigate build: ${err.message}${colors.reset}`);
+    process.exit(1);
+  }
+}
+
+async function assetsList(args) {
+  const projectId = args.project || loadConfig().defaultProject;
+  if (!projectId) {
+    console.error(`${colors.err}✗ Missing project ID. Use --project <id>${colors.reset}`);
+    process.exit(1);
+  }
+
+  const query = new URLSearchParams();
+  if (args.pending) query.set("pending_approval", "true");
+  if (args.type) query.set("asset_type", args.type);
+  if (args.limit) query.set("limit", args.limit || "20");
+
+  try {
+    const res = await request("GET", `/api/v1/projects/${projectId}/assets?${query.toString()}`);
+    if (args.json) {
+      console.log(JSON.stringify(res.assets, null, 2));
+      return;
+    }
+    console.log(`\n${colors.bold}ASSETS for Project #${projectId} (${res.assets.length})${colors.reset}`);
+    console.log("----------------------------------------------------------------------");
+    res.assets.forEach((a) => {
+      const statusColor = a.approval_status === "approved" ? colors.ok : a.approval_status === "denied" ? colors.err : colors.warn;
+      console.log(
+        `  ${a.id.substring(0, 8)} ${statusColor}[${a.approval_status}]${colors.reset} ${colors.accent}[${a.asset_type}]${colors.reset} ${a.name} ${colors.muted}(${a.depot_path || a.path})${colors.reset}`
+      );
+    });
+    console.log("");
+  } catch (err) {
+    console.error(`${colors.err}✗ Failed to list assets: ${err.message}${colors.reset}`);
+    process.exit(1);
+  }
+}
+
+async function assetsApprove(args) {
+  const projectId = args.project || loadConfig().defaultProject;
+  const assetId = args._[2];
+  if (!projectId || !assetId) {
+    console.error(`${colors.err}✗ Usage: butter assets approve <asset_id> --project <id> [--comment <text>]${colors.reset}`);
+    process.exit(1);
+  }
+
+  try {
+    const res = await request("POST", `/api/v1/projects/${projectId}/assets/${assetId}/approvals`, {
+      status: "approved",
+      comments: args.comment || "Approved via ButterStack CLI"
+    });
+    if (args.json) {
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+    console.log(`${colors.ok}✓ Asset ${assetId} approved successfully.${colors.reset}`);
+  } catch (err) {
+    console.error(`${colors.err}✗ Failed to approve asset: ${err.message}${colors.reset}`);
+    process.exit(1);
+  }
+}
+
+async function assetsDeny(args) {
+  const projectId = args.project || loadConfig().defaultProject;
+  const assetId = args._[2];
+  const reason = args.reason || args.comment || "Denied via ButterStack CLI";
+  if (!projectId || !assetId) {
+    console.error(`${colors.err}✗ Usage: butter assets deny <asset_id> --project <id> [--reason <text>]${colors.reset}`);
+    process.exit(1);
+  }
+
+  try {
+    const res = await request("POST", `/api/v1/projects/${projectId}/assets/${assetId}/approvals`, {
+      status: "denied",
+      comments: reason
+    });
+    if (args.json) {
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+    console.log(`${colors.warn}✓ Asset ${assetId} denied with feedback: "${reason}"${colors.reset}`);
+  } catch (err) {
+    console.error(`${colors.err}✗ Failed to deny asset: ${err.message}${colors.reset}`);
+    process.exit(1);
+  }
+}
+
+function parseArgs(rawArgs) {
+  const parsed = { _: [] };
+  for (let i = 0; i < rawArgs.length; i++) {
+    const arg = rawArgs[i];
+    if (arg.startsWith("--")) {
+      const key = arg.substring(2);
+      if (i + 1 < rawArgs.length && !rawArgs[i + 1].startsWith("-")) {
+        parsed[key] = rawArgs[++i];
+      } else {
+        parsed[key] = true;
+      }
+    } else if (arg.startsWith("-")) {
+      const key = arg.substring(1);
+      parsed[key] = true;
+    } else {
+      parsed._.push(arg);
+    }
+  }
+  return parsed;
+}
+
+function printHelp() {
+  console.log(`
+${colors.accent}${colors.bold}ButterStack CLI (butter)${colors.reset}
+Fast, scriptable command line interface for game pipelines.
+
+${colors.bold}USAGE:${colors.reset}
+  butter <command> [subcommand] [options]
+
+${colors.bold}COMMANDS:${colors.reset}
+  ${colors.accent}auth${colors.reset} login | whoami | logout    Authenticate via browser OAuth loopback
+  ${colors.accent}projects${colors.reset} list | show <id>         View and inspect game projects
+  ${colors.accent}tasks${colors.reset} list | create | update       Manage tasks, bugs, and backlog
+  ${colors.accent}builds${colors.reset} list | show | investigate   Inspect CI/CD engine builds and AI failure logs
+  ${colors.accent}assets${colors.reset} list | show | approve | deny Review and approve textures, models, and audio
+
+${colors.bold}GLOBAL OPTIONS:${colors.reset}
+  --project <id>       Target project ID (e.g. --project 1)
+  --host <url>         ButterStack API host (default: https://www.butterstack.com)
+  --token <token>      Explicit API token override
+  --json               Output machine-readable JSON
+  --help, -h           Show this help message
+
+${colors.bold}AUTH OPTIONS:${colors.reset}
+  --scope <name|list>  Request less than the full permission set on login.
+                        Presets: read-only. Or a raw space/comma-separated
+                        list, e.g. --scope read:projects,read:builds
+                        (default: the full CLI scope set)
+
+Tokens expire 90 days after issue; ${colors.bold}butter auth whoami${colors.reset} shows the
+remaining lifetime and ${colors.bold}butter auth login${colors.reset} again renews it.
+`);
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  cliArgs = args; // see getHost() -- makes --host visible to request() everywhere
+  const cmd = args._[0];
+  const subcmd = args._[1];
+
+  if (args.help || args.h || !cmd) {
+    printHelp();
+    return;
+  }
+
+  switch (cmd) {
+    case "auth":
+      if (subcmd === "login") return authLogin(args);
+      if (subcmd === "whoami" || subcmd === "status") return authWhoami(args);
+      if (subcmd === "logout") return authLogout();
+      break;
+    case "projects":
+    case "project":
+      if (subcmd === "list" || !subcmd) return projectsList(args);
+      break;
+    case "tasks":
+    case "task":
+      if (subcmd === "list" || !subcmd) return tasksList(args);
+      if (subcmd === "create") return tasksCreate(args);
+      break;
+    case "builds":
+    case "build":
+      if (subcmd === "list" || !subcmd) return buildsList(args);
+      if (subcmd === "investigate") return buildsInvestigate(args);
+      break;
+    case "assets":
+    case "asset":
+      if (subcmd === "list" || !subcmd) return assetsList(args);
+      if (subcmd === "approve") return assetsApprove(args);
+      if (subcmd === "deny") return assetsDeny(args);
+      break;
+    default:
+      console.error(`${colors.err}Unknown command: ${cmd}${colors.reset}`);
+      printHelp();
+      process.exit(1);
+  }
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`${colors.err}Error: ${err.message}${colors.reset}`);
+    process.exit(1);
+  });
+}
+
+module.exports = { request, loadCredentials, saveCredentials, getHost };
