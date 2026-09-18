@@ -364,3 +364,216 @@ test("F2 (real flow): auth login persists the token when granted scope matches w
     rmHome(home);
   }
 });
+
+// -- #1938: the builds read path ---------------------------------------------
+//
+// Three defects, all of which made a build's data look absent rather than
+// unreachable: `builds show` was never wired into the dispatcher (silent
+// exit 0), `--json` before a positional swallowed it as the flag's value,
+// and there was no GET counterpart to `investigate`, so checking a result
+// meant paying for a new one.
+
+// A server that answers the build endpoints with fixed JSON and records
+// every request, so a test can assert on the METHOD used, not just output.
+function startApiServer(routes) {
+  const requests = createQueue();
+  const server = http.createServer((req, res) => {
+    requests.push({ method: req.method, url: req.url });
+    const key = `${req.method} ${req.url.split("?")[0]}`;
+    const route = routes[key];
+    const status = route ? route.status || 200 : 404;
+    const body = JSON.stringify(route ? route.body : { error: "not_found", message: "no route" });
+    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
+    res.end(body);
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => resolve({ server, port: server.address().port, requests }));
+  });
+}
+
+const BUILD_ID = "aeae7611-6d48-4601-8654-80169314e5ec";
+
+const BUILD_DETAIL = {
+  id: BUILD_ID,
+  status: "failed",
+  overall_status: "failed",
+  build_type: "custom",
+  target_type: null,
+  commit_hash: "p4-207",
+  ci_job_name: "PilotLight_Verify",
+  duration: 0.764199,
+  created_at: "2026-09-18T10:55:02-04:00",
+  log_available: false,
+  log_unavailable_reason:
+    "TeamCity cannot be polled by ButterStack, so its logs must be pushed on the webhook payload as `logs_tail`.",
+  steps: [{ step_type: "external_build", status: "failed", duration: null, message: "TeamCity build failed" }],
+  investigation: null
+};
+
+const INVESTIGATION = {
+  investigation_id: "inv-1",
+  status: "completed",
+  diagnosis_category: "compile_error",
+  severity: "high",
+  confidence: "medium",
+  summary: "Godot parse error in main.gd",
+  diagnosis: "main.gd calls show_results() with 7 arguments against a 6-parameter definition.",
+  suggested_fix: "Reconcile screen_flow.gd with the current show_results() signature.",
+  attributed_user_id: null,
+  attributed_changelist: null,
+  affected_files: ["src/main.gd"],
+  evidence: ["SCRIPT ERROR: Parse Error: Too many arguments"],
+  error_message: null,
+  steps: [{ step: 1, step_type: "tool_use", content: null }]
+};
+
+test("#1938: `builds show` renders a build instead of exiting 0 with no output", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    [`GET /api/v1/projects/108/build_runs/${BUILD_ID}`]: { body: BUILD_DETAIL }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout, success } = await runButter(["builds", "show", BUILD_ID, "--project", "108"], { home });
+
+    assert.equal(success, true);
+    assert.ok(stdout.includes(BUILD_ID), "the build id should be printed");
+    assert.ok(stdout.includes("PilotLight_Verify"), "the job name should be printed");
+    assert.ok(stdout.includes("p4-207"), "the commit should be printed");
+    assert.ok(stdout.trim().length > 0, "the whole defect was that this printed nothing");
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("#1940: `builds show` says the build log is missing, and why", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    [`GET /api/v1/projects/108/build_runs/${BUILD_ID}`]: { body: BUILD_DETAIL }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout } = await runButter(["builds", "show", BUILD_ID, "--project", "108"], { home });
+
+    assert.ok(stdout.includes("not available"), "a missing log must be called out");
+    assert.ok(stdout.includes("logs_tail"), "and the reason must name the fix");
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("#1938: a boolean flag before a positional no longer swallows it", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    [`GET /api/v1/projects/108/build_runs/${BUILD_ID}`]: { body: BUILD_DETAIL }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+
+    // --json BEFORE the build id: the exact shape that used to parse as
+    // json: "<build id>" and leave no positional argument behind.
+    const before = await runButter(["builds", "show", "--json", BUILD_ID, "--project", "108"], { home });
+    assert.equal(before.success, true, `expected success, got stderr: ${before.stderr}`);
+    assert.equal(JSON.parse(before.stdout).id, BUILD_ID);
+
+    // ...and after it, which always worked, must keep working.
+    const after = await runButter(["builds", "show", BUILD_ID, "--project", "108", "--json"], { home });
+    assert.equal(after.success, true);
+    assert.equal(JSON.parse(after.stdout).id, BUILD_ID);
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("#1938: `builds investigation` reads the result with GET, never POST", async () => {
+  const home = mkHome();
+  const { server, port, requests } = await startApiServer({
+    [`GET /api/v1/projects/108/build_runs/${BUILD_ID}/investigation`]: { body: INVESTIGATION }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout, success } = await runButter(
+      ["builds", "investigation", BUILD_ID, "--project", "108"],
+      { home }
+    );
+
+    assert.equal(success, true);
+    assert.ok(stdout.includes("Godot parse error in main.gd"));
+    assert.ok(stdout.includes("compile_error"));
+
+    const req = await requests.pop(2000);
+    assert.equal(req.method, "GET", "reading a result must not be a POST -- a POST is a paid AI call");
+    assert.ok(req.url.endsWith("/investigation"));
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("#1940: an unattributed investigation prints 'unattributed', not a guess", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    [`GET /api/v1/projects/108/build_runs/${BUILD_ID}/investigation`]: { body: INVESTIGATION }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout } = await runButter(["builds", "investigation", BUILD_ID, "--project", "108"], { home });
+    assert.ok(stdout.includes("unattributed"));
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("#1938: a missing investigation is an explicit message, not an empty success", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({});
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stderr, success } = await runButter(
+      ["builds", "investigation", BUILD_ID, "--project", "108"],
+      { home }
+    );
+
+    assert.equal(success, false, "nothing to read is a failure exit, not a silent 0");
+    assert.ok(stderr.includes("No investigation has been run"));
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("#1938: an unknown subcommand fails loudly instead of exiting 0 silently", async () => {
+  const home = mkHome();
+  try {
+    const { stderr, success } = await runButter(["builds", "frobnicate", "--project", "108"], { home });
+    assert.equal(success, false);
+    assert.ok(stderr.includes("Unknown subcommand"));
+  } finally {
+    rmHome(home);
+  }
+});
+
+test("#1938: a server with no investigation key is not reported as 'no investigation'", async () => {
+  const home = mkHome();
+  const { investigation, ...withoutKey } = BUILD_DETAIL; // eslint-disable-line no-unused-vars
+  const { server, port } = await startApiServer({
+    [`GET /api/v1/projects/108/build_runs/${BUILD_ID}`]: { body: withoutKey }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout } = await runButter(["builds", "show", BUILD_ID, "--project", "108"], { home });
+
+    assert.ok(stdout.includes("does not expose investigations"));
+    assert.ok(
+      !stdout.includes("No AI investigation has been run"),
+      "an old server must not be reported as a build with no investigation"
+    );
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
