@@ -43,11 +43,7 @@ function writeCredentials(home, { host, token = "test-token" }) {
 // explicit null/undefined value meaning "unset this variable" -- needed
 // for the "no BUTTERSTACK_HOST at all" case.
 function buildEnv(env) {
-  // Never launch a real browser from a test. The auth-login cases spawn the
-  // actual binary, which calls openBrowser() -> `open <url>` on macOS, so
-  // every `npm test` run left tabs pointing at loopback ports that close
-  // seconds later. Set before the per-test overrides so a test could still
-  // opt out deliberately.
+  // No real browser from a test. Set before the overrides so a test can opt out.
   const fullEnv = { ...process.env, BUTTERSTACK_NO_BROWSER: "1", HOME: env.home };
   for (const [key, value] of Object.entries(env.overrides || {})) {
     if (value === null || value === undefined) delete fullEnv[key];
@@ -583,30 +579,21 @@ test("#1938: a server with no investigation key is not reported as 'no investiga
   }
 });
 
-// Regression guard for the browser-tab leak: `npm test` spawns the real binary
-// for the auth-login cases, and openBrowser() shells out to `open` on macOS.
-// Every run used to leave two tabs pointing at loopback ports that close
-// seconds later. buildEnv() now sets BUTTERSTACK_NO_BROWSER for all test
-// invocations; this asserts the binary actually honors it.
-// Collects everything the child writes to stdout until it exits, so a test can
-// assert on the whole rendered block rather than the first line readAuthUrl
-// happened to match.
+// buildEnv sets BUTTERSTACK_NO_BROWSER for every test; this pins that the
+// binary honors it.
+// Buffers the child's full stdout, so tests can assert on the whole block.
 function captureStdout(child) {
   let out = "";
   child.stdout.on("data", (c) => (out += c));
   return () => out;
 }
 
-// ANSI colour codes make exact-match assertions unreadable; the codes are not
-// what these tests are about.
 function stripAnsi(s) {
   return s.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
-// readAuthUrl matches with (\S+) against coloured output, and ANSI escape
-// characters are non-space, so the URL it returns has a trailing reset code
-// glued to it. Harmless for `new URL(...)` (it lands inside the last query
-// value) but fatal to any exact string comparison.
+// readAuthUrl's (\S+) swallows the trailing ANSI reset. Fine for `new URL()`,
+// fatal for string comparison.
 function cleanUrl(u) {
   return stripAnsi(u);
 }
@@ -631,20 +618,17 @@ test("auth login prints the URL exactly once, and does not claim to open a brows
 
     const out = stripAnsi(readOut());
 
-    // The URL appeared twice before this was fixed: once from authLogin's
-    // "URL:" line and again from openBrowser's fallback message.
+    // Printed twice before the fix: authLogin's line, then openBrowser's.
     const occurrences = out.split(authUrl).length - 1;
     assert.equal(occurrences, 1, `the auth URL should appear exactly once, saw ${occurrences}:\n${out}`);
 
-    // Claiming to open a browser while deliberately not opening one is a lie
-    // the user can see.
     assert.ok(
       !out.includes("Opening your browser"),
       `must not claim to open a browser when BUTTERSTACK_NO_BROWSER is set:\n${out}`
     );
     assert.ok(out.includes("Visit this URL to authorize:"), `expected the no-browser prompt:\n${out}`);
 
-    // That fallback belongs to the spawn-failure path, which is not this one.
+    // Those belong to the spawn-failure path, not this one.
     assert.ok(!out.includes("Could not automatically open browser"), out);
     assert.ok(!out.includes("Please visit this URL to authenticate"), out);
   } finally {
@@ -672,7 +656,6 @@ test("the no-browser prompt replaces the browser line rather than adding to it",
 
     const lines = stripAnsi(readOut()).split("\n").map((l) => l.trim()).filter(Boolean);
 
-    // Exactly one line introduces the URL, and exactly one line carries it.
     const intro = lines.filter((l) => /^Visit this URL to authorize:$/.test(l));
     const urlLines = lines.filter((l) => l.startsWith("URL: "));
     assert.equal(intro.length, 1, `expected one intro line, got ${intro.length}:\n${lines.join("\n")}`);
@@ -716,11 +699,8 @@ test("auth login honors BUTTERSTACK_NO_BROWSER and prints the URL instead", asyn
   }
 });
 
-// The interactive path, exercised without launching anything real: a shim
-// named `open` (macOS) / `xdg-open` (linux) is placed first on PATH and
-// records its argv. This is the only case that covers the branch a user
-// actually hits, and it asserts both halves of it - the line that claims a
-// browser is opening, and the browser actually being handed the URL.
+// The branch a real user hits. A shim `open`/`xdg-open` first on PATH records
+// its argv, so the real path runs and nothing launches.
 test("without the flag, auth login says it is opening a browser and hands it the URL", async () => {
   const home = mkHome();
   const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "butter-shim-"));
@@ -753,12 +733,9 @@ test("without the flag, auth login says it is opening a browser and hands it the
     assert.ok(out.includes("Opening your browser"), `expected the browser line:\n${out}`);
     assert.ok(!out.includes("Visit this URL to authorize:"), `no-browser prompt must not appear:\n${out}`);
 
-    // Still exactly once, on this path too.
     assert.equal(out.split(authUrl).length - 1, 1, `URL should appear once:\n${out}`);
 
-    // And the browser really was invoked, with the same URL the user was shown.
-    // openBrowser() spawns asynchronously and does not wait, so the shim can
-    // still be writing when the CLI process has already exited.
+    // openBrowser spawns without waiting, so the shim may still be writing.
     for (let i = 0; i < 50 && !fs.existsSync(argvLog); i++) {
       await new Promise((r) => setTimeout(r, 20));
     }

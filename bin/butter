@@ -105,14 +105,8 @@ function clearCredentials() {
 }
 
 function openBrowser(url) {
-  // BUTTERSTACK_NO_BROWSER exists for anything that drives `auth login`
-  // without a human at the keyboard. The two auth-login tests spawn the real
-  // binary against a throwaway loopback server, so every `npm test` run used
-  // to fire `open` twice and leave real browser tabs pointing at ports that
-  // close seconds later.
-  //
-  // Nothing to print here: authLogin already wrote the URL, and adds its own
-  // "Visit this URL to authorize:" line when this flag is set.
+  // For non-interactive callers (tests, CI, containers). authLogin has already
+  // printed the URL, so there is nothing to add here.
   if (process.env.BUTTERSTACK_NO_BROWSER) return;
 
   // spawn with an argument array, not a shell string built via exec(): the
