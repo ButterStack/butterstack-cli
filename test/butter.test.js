@@ -43,7 +43,8 @@ function writeCredentials(home, { host, token = "test-token" }) {
 // explicit null/undefined value meaning "unset this variable" -- needed
 // for the "no BUTTERSTACK_HOST at all" case.
 function buildEnv(env) {
-  const fullEnv = { ...process.env, HOME: env.home };
+  // No real browser from a test. Set before the overrides so a test can opt out.
+  const fullEnv = { ...process.env, BUTTERSTACK_NO_BROWSER: "1", HOME: env.home };
   for (const [key, value] of Object.entries(env.overrides || {})) {
     if (value === null || value === undefined) delete fullEnv[key];
     else fullEnv[key] = value;
@@ -574,6 +575,176 @@ test("#1938: a server with no investigation key is not reported as 'no investiga
     );
   } finally {
     await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+// buildEnv sets BUTTERSTACK_NO_BROWSER for every test; this pins that the
+// binary honors it.
+// Buffers the child's full stdout, so tests can assert on the whole block.
+function captureStdout(child) {
+  let out = "";
+  child.stdout.on("data", (c) => (out += c));
+  return () => out;
+}
+
+function stripAnsi(s) {
+  return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+// readAuthUrl's (\S+) swallows the trailing ANSI reset. Fine for `new URL()`,
+// fatal for string comparison.
+function cleanUrl(u) {
+  return stripAnsi(u);
+}
+
+test("auth login prints the URL exactly once, and does not claim to open a browser", async () => {
+  const home = mkHome();
+  const { server, port } = await startCaptureServer();
+  try {
+    const child = spawn(
+      process.execPath,
+      [BUTTER_BIN, "auth", "login", "--host", `http://127.0.0.1:${port}`],
+      { env: buildEnv({ home }) }
+    );
+    const readOut = captureStdout(child);
+
+    const authUrl = cleanUrl(await readAuthUrl(child));
+    const parsed = new URL(authUrl);
+    await hitCallback(
+      `http://127.0.0.1:${parsed.searchParams.get("port")}/callback?code=c&state=${parsed.searchParams.get("state")}`
+    );
+    await waitForExit(child);
+
+    const out = stripAnsi(readOut());
+
+    // Printed twice before the fix: authLogin's line, then openBrowser's.
+    const occurrences = out.split(authUrl).length - 1;
+    assert.equal(occurrences, 1, `the auth URL should appear exactly once, saw ${occurrences}:\n${out}`);
+
+    assert.ok(
+      !out.includes("Opening your browser"),
+      `must not claim to open a browser when BUTTERSTACK_NO_BROWSER is set:\n${out}`
+    );
+    assert.ok(out.includes("Visit this URL to authorize:"), `expected the no-browser prompt:\n${out}`);
+
+    // Those belong to the spawn-failure path, not this one.
+    assert.ok(!out.includes("Could not automatically open browser"), out);
+    assert.ok(!out.includes("Please visit this URL to authenticate"), out);
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("the no-browser prompt replaces the browser line rather than adding to it", async () => {
+  const home = mkHome();
+  const { server, port } = await startCaptureServer();
+  try {
+    const child = spawn(
+      process.execPath,
+      [BUTTER_BIN, "auth", "login", "--host", `http://127.0.0.1:${port}`],
+      { env: buildEnv({ home }) }
+    );
+    const readOut = captureStdout(child);
+    const authUrl = cleanUrl(await readAuthUrl(child));
+    const parsed = new URL(authUrl);
+    await hitCallback(
+      `http://127.0.0.1:${parsed.searchParams.get("port")}/callback?code=c&state=${parsed.searchParams.get("state")}`
+    );
+    await waitForExit(child);
+
+    const lines = stripAnsi(readOut()).split("\n").map((l) => l.trim()).filter(Boolean);
+
+    const intro = lines.filter((l) => /^Visit this URL to authorize:$/.test(l));
+    const urlLines = lines.filter((l) => l.startsWith("URL: "));
+    assert.equal(intro.length, 1, `expected one intro line, got ${intro.length}:\n${lines.join("\n")}`);
+    assert.equal(urlLines.length, 1, `expected one URL line, got ${urlLines.length}:\n${lines.join("\n")}`);
+    assert.equal(urlLines[0], `URL: ${authUrl}`);
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("auth login honors BUTTERSTACK_NO_BROWSER and prints the URL instead", async () => {
+  const home = mkHome();
+  const { server, port } = await startCaptureServer();
+  try {
+    const child = spawn(
+      process.execPath,
+      [BUTTER_BIN, "auth", "login", "--host", `http://127.0.0.1:${port}`],
+      { env: buildEnv({ home }) }
+    );
+
+    const authUrl = await readAuthUrl(child);
+    assert.ok(authUrl.startsWith("http://127.0.0.1:"), "the URL must still be printed for the user");
+
+    let stdout = "";
+    child.stdout.on("data", (c) => (stdout += c));
+
+    const parsed = new URL(authUrl);
+    await hitCallback(
+      `http://127.0.0.1:${parsed.searchParams.get("port")}/callback?code=c&state=${parsed.searchParams.get("state")}`
+    );
+    await waitForExit(child);
+
+    assert.ok(
+      !stdout.includes("Could not automatically open browser"),
+      "the no-browser path must not fall through to the spawn-error branch"
+    );
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+// The branch a real user hits. A shim `open`/`xdg-open` first on PATH records
+// its argv, so the real path runs and nothing launches.
+test("without the flag, auth login says it is opening a browser and hands it the URL", async () => {
+  const home = mkHome();
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "butter-shim-"));
+  const argvLog = path.join(shimDir, "argv.txt");
+  const shimName = process.platform === "darwin" ? "open" : "xdg-open";
+  fs.writeFileSync(
+    path.join(shimDir, shimName),
+    `#!/bin/sh\nprintf '%s\\n' "$1" >> ${JSON.stringify(argvLog)}\n`,
+    { mode: 0o755 }
+  );
+
+  const { server, port } = await startCaptureServer();
+  try {
+    const child = spawn(process.execPath, [BUTTER_BIN, "auth", "login", "--host", `http://127.0.0.1:${port}`], {
+      env: {
+        ...buildEnv({ home, overrides: { BUTTERSTACK_NO_BROWSER: null } }),
+        PATH: `${shimDir}:${process.env.PATH}`
+      }
+    });
+    const readOut = captureStdout(child);
+
+    const authUrl = cleanUrl(await readAuthUrl(child));
+    const parsed = new URL(authUrl);
+    await hitCallback(
+      `http://127.0.0.1:${parsed.searchParams.get("port")}/callback?code=c&state=${parsed.searchParams.get("state")}`
+    );
+    await waitForExit(child);
+
+    const out = stripAnsi(readOut());
+    assert.ok(out.includes("Opening your browser"), `expected the browser line:\n${out}`);
+    assert.ok(!out.includes("Visit this URL to authorize:"), `no-browser prompt must not appear:\n${out}`);
+
+    assert.equal(out.split(authUrl).length - 1, 1, `URL should appear once:\n${out}`);
+
+    // openBrowser spawns without waiting, so the shim may still be writing.
+    for (let i = 0; i < 50 && !fs.existsSync(argvLog); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(fs.existsSync(argvLog), "the browser helper should have been spawned");
+    const handed = stripAnsi(fs.readFileSync(argvLog, "utf-8")).trim();
+    assert.equal(handed, authUrl, "the browser must receive the URL that was printed");
+  } finally {
+    await stopCaptureServer(server);
+    fs.rmSync(shimDir, { recursive: true, force: true });
     rmHome(home);
   }
 });

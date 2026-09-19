@@ -105,6 +105,10 @@ function clearCredentials() {
 }
 
 function openBrowser(url) {
+  // For non-interactive callers (tests, CI, containers). authLogin has already
+  // printed the URL, so there is nothing to add here.
+  if (process.env.BUTTERSTACK_NO_BROWSER) return;
+
   // spawn with an argument array, not a shell string built via exec(): the
   // URL is host-derived (--host / BUTTERSTACK_HOST / config), so a malicious
   // or malformed host value can never be interpreted by a shell, only
@@ -374,7 +378,11 @@ async function authLogin(args) {
       authUrl += `&scope=${encodeURIComponent(requestedScope)}`;
     }
 
-    console.log(`Opening your browser for one-click authorization...`);
+    if (process.env.BUTTERSTACK_NO_BROWSER) {
+      console.log(`Visit this URL to authorize:`);
+    } else {
+      console.log(`Opening your browser for one-click authorization...`);
+    }
     console.log(`${colors.dim}URL: ${authUrl}${colors.reset}\n`);
     openBrowser(authUrl);
   });
