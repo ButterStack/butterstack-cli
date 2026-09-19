@@ -588,6 +588,102 @@ test("#1938: a server with no investigation key is not reported as 'no investiga
 // Every run used to leave two tabs pointing at loopback ports that close
 // seconds later. buildEnv() now sets BUTTERSTACK_NO_BROWSER for all test
 // invocations; this asserts the binary actually honors it.
+// Collects everything the child writes to stdout until it exits, so a test can
+// assert on the whole rendered block rather than the first line readAuthUrl
+// happened to match.
+function captureStdout(child) {
+  let out = "";
+  child.stdout.on("data", (c) => (out += c));
+  return () => out;
+}
+
+// ANSI colour codes make exact-match assertions unreadable; the codes are not
+// what these tests are about.
+function stripAnsi(s) {
+  return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+// readAuthUrl matches with (\S+) against coloured output, and ANSI escape
+// characters are non-space, so the URL it returns has a trailing reset code
+// glued to it. Harmless for `new URL(...)` (it lands inside the last query
+// value) but fatal to any exact string comparison.
+function cleanUrl(u) {
+  return stripAnsi(u);
+}
+
+test("auth login prints the URL exactly once, and does not claim to open a browser", async () => {
+  const home = mkHome();
+  const { server, port } = await startCaptureServer();
+  try {
+    const child = spawn(
+      process.execPath,
+      [BUTTER_BIN, "auth", "login", "--host", `http://127.0.0.1:${port}`],
+      { env: buildEnv({ home }) }
+    );
+    const readOut = captureStdout(child);
+
+    const authUrl = cleanUrl(await readAuthUrl(child));
+    const parsed = new URL(authUrl);
+    await hitCallback(
+      `http://127.0.0.1:${parsed.searchParams.get("port")}/callback?code=c&state=${parsed.searchParams.get("state")}`
+    );
+    await waitForExit(child);
+
+    const out = stripAnsi(readOut());
+
+    // The URL appeared twice before this was fixed: once from authLogin's
+    // "URL:" line and again from openBrowser's fallback message.
+    const occurrences = out.split(authUrl).length - 1;
+    assert.equal(occurrences, 1, `the auth URL should appear exactly once, saw ${occurrences}:\n${out}`);
+
+    // Claiming to open a browser while deliberately not opening one is a lie
+    // the user can see.
+    assert.ok(
+      !out.includes("Opening your browser"),
+      `must not claim to open a browser when BUTTERSTACK_NO_BROWSER is set:\n${out}`
+    );
+    assert.ok(out.includes("Visit this URL to authorize:"), `expected the no-browser prompt:\n${out}`);
+
+    // That fallback belongs to the spawn-failure path, which is not this one.
+    assert.ok(!out.includes("Could not automatically open browser"), out);
+    assert.ok(!out.includes("Please visit this URL to authenticate"), out);
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("the no-browser prompt replaces the browser line rather than adding to it", async () => {
+  const home = mkHome();
+  const { server, port } = await startCaptureServer();
+  try {
+    const child = spawn(
+      process.execPath,
+      [BUTTER_BIN, "auth", "login", "--host", `http://127.0.0.1:${port}`],
+      { env: buildEnv({ home }) }
+    );
+    const readOut = captureStdout(child);
+    const authUrl = cleanUrl(await readAuthUrl(child));
+    const parsed = new URL(authUrl);
+    await hitCallback(
+      `http://127.0.0.1:${parsed.searchParams.get("port")}/callback?code=c&state=${parsed.searchParams.get("state")}`
+    );
+    await waitForExit(child);
+
+    const lines = stripAnsi(readOut()).split("\n").map((l) => l.trim()).filter(Boolean);
+
+    // Exactly one line introduces the URL, and exactly one line carries it.
+    const intro = lines.filter((l) => /^Visit this URL to authorize:$/.test(l));
+    const urlLines = lines.filter((l) => l.startsWith("URL: "));
+    assert.equal(intro.length, 1, `expected one intro line, got ${intro.length}:\n${lines.join("\n")}`);
+    assert.equal(urlLines.length, 1, `expected one URL line, got ${urlLines.length}:\n${lines.join("\n")}`);
+    assert.equal(urlLines[0], `URL: ${authUrl}`);
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
 test("auth login honors BUTTERSTACK_NO_BROWSER and prints the URL instead", async () => {
   const home = mkHome();
   const { server, port } = await startCaptureServer();
@@ -616,6 +712,62 @@ test("auth login honors BUTTERSTACK_NO_BROWSER and prints the URL instead", asyn
     );
   } finally {
     await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+// The interactive path, exercised without launching anything real: a shim
+// named `open` (macOS) / `xdg-open` (linux) is placed first on PATH and
+// records its argv. This is the only case that covers the branch a user
+// actually hits, and it asserts both halves of it - the line that claims a
+// browser is opening, and the browser actually being handed the URL.
+test("without the flag, auth login says it is opening a browser and hands it the URL", async () => {
+  const home = mkHome();
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "butter-shim-"));
+  const argvLog = path.join(shimDir, "argv.txt");
+  const shimName = process.platform === "darwin" ? "open" : "xdg-open";
+  fs.writeFileSync(
+    path.join(shimDir, shimName),
+    `#!/bin/sh\nprintf '%s\\n' "$1" >> ${JSON.stringify(argvLog)}\n`,
+    { mode: 0o755 }
+  );
+
+  const { server, port } = await startCaptureServer();
+  try {
+    const child = spawn(process.execPath, [BUTTER_BIN, "auth", "login", "--host", `http://127.0.0.1:${port}`], {
+      env: {
+        ...buildEnv({ home, overrides: { BUTTERSTACK_NO_BROWSER: null } }),
+        PATH: `${shimDir}:${process.env.PATH}`
+      }
+    });
+    const readOut = captureStdout(child);
+
+    const authUrl = cleanUrl(await readAuthUrl(child));
+    const parsed = new URL(authUrl);
+    await hitCallback(
+      `http://127.0.0.1:${parsed.searchParams.get("port")}/callback?code=c&state=${parsed.searchParams.get("state")}`
+    );
+    await waitForExit(child);
+
+    const out = stripAnsi(readOut());
+    assert.ok(out.includes("Opening your browser"), `expected the browser line:\n${out}`);
+    assert.ok(!out.includes("Visit this URL to authorize:"), `no-browser prompt must not appear:\n${out}`);
+
+    // Still exactly once, on this path too.
+    assert.equal(out.split(authUrl).length - 1, 1, `URL should appear once:\n${out}`);
+
+    // And the browser really was invoked, with the same URL the user was shown.
+    // openBrowser() spawns asynchronously and does not wait, so the shim can
+    // still be writing when the CLI process has already exited.
+    for (let i = 0; i < 50 && !fs.existsSync(argvLog); i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(fs.existsSync(argvLog), "the browser helper should have been spawned");
+    const handed = stripAnsi(fs.readFileSync(argvLog, "utf-8")).trim();
+    assert.equal(handed, authUrl, "the browser must receive the URL that was printed");
+  } finally {
+    await stopCaptureServer(server);
+    fs.rmSync(shimDir, { recursive: true, force: true });
     rmHome(home);
   }
 });
