@@ -43,7 +43,12 @@ function writeCredentials(home, { host, token = "test-token" }) {
 // explicit null/undefined value meaning "unset this variable" -- needed
 // for the "no BUTTERSTACK_HOST at all" case.
 function buildEnv(env) {
-  const fullEnv = { ...process.env, HOME: env.home };
+  // Never launch a real browser from a test. The auth-login cases spawn the
+  // actual binary, which calls openBrowser() -> `open <url>` on macOS, so
+  // every `npm test` run left tabs pointing at loopback ports that close
+  // seconds later. Set before the per-test overrides so a test could still
+  // opt out deliberately.
+  const fullEnv = { ...process.env, BUTTERSTACK_NO_BROWSER: "1", HOME: env.home };
   for (const [key, value] of Object.entries(env.overrides || {})) {
     if (value === null || value === undefined) delete fullEnv[key];
     else fullEnv[key] = value;
@@ -571,6 +576,43 @@ test("#1938: a server with no investigation key is not reported as 'no investiga
     assert.ok(
       !stdout.includes("No AI investigation has been run"),
       "an old server must not be reported as a build with no investigation"
+    );
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+// Regression guard for the browser-tab leak: `npm test` spawns the real binary
+// for the auth-login cases, and openBrowser() shells out to `open` on macOS.
+// Every run used to leave two tabs pointing at loopback ports that close
+// seconds later. buildEnv() now sets BUTTERSTACK_NO_BROWSER for all test
+// invocations; this asserts the binary actually honors it.
+test("auth login honors BUTTERSTACK_NO_BROWSER and prints the URL instead", async () => {
+  const home = mkHome();
+  const { server, port } = await startCaptureServer();
+  try {
+    const child = spawn(
+      process.execPath,
+      [BUTTER_BIN, "auth", "login", "--host", `http://127.0.0.1:${port}`],
+      { env: buildEnv({ home }) }
+    );
+
+    const authUrl = await readAuthUrl(child);
+    assert.ok(authUrl.startsWith("http://127.0.0.1:"), "the URL must still be printed for the user");
+
+    let stdout = "";
+    child.stdout.on("data", (c) => (stdout += c));
+
+    const parsed = new URL(authUrl);
+    await hitCallback(
+      `http://127.0.0.1:${parsed.searchParams.get("port")}/callback?code=c&state=${parsed.searchParams.get("state")}`
+    );
+    await waitForExit(child);
+
+    assert.ok(
+      !stdout.includes("Could not automatically open browser"),
+      "the no-browser path must not fall through to the spawn-error branch"
     );
   } finally {
     await stopCaptureServer(server);
