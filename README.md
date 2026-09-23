@@ -80,6 +80,32 @@ butter assets approve <asset_id> --project <id> [--comment <text>]
 butter assets deny <asset_id> --project <id> [--reason <text>]
 ```
 
+### MCP (AI clients)
+
+The ButterStack MCP server (`npx -y butterstack-mcp`) uses the credential `butter auth login` stores, so log in first. Then write the MCP entry into your AI client's config:
+
+```
+butter mcp install [--opencode] [--claude] [--cursor] [--dry-run]
+```
+
+With no client flag, every installed client is configured. A client flag limits the install to that client and creates its config file if it does not exist yet. Each client gets the entry in its own schema, which matters because they differ: a Claude-style entry in an OpenCode config stops OpenCode from starting.
+
+| Flag | Client | Config file | Entry |
+|---|---|---|---|
+| `--opencode` | OpenCode | `~/.config/opencode/opencode.jsonc` (or `opencode.json`) | `mcp.butterstack` with `type: "local"`, `command: ["npx", "-y", "butterstack-mcp"]`, `enabled: true` |
+| `--claude` | Claude Desktop | macOS `~/Library/Application Support/Claude/claude_desktop_config.json`, Windows `%APPDATA%\Claude\claude_desktop_config.json`, Linux `~/.config/Claude/claude_desktop_config.json` | `mcpServers.butterstack` with `command: "npx"`, `args: ["-y", "butterstack-mcp"]` |
+| `--cursor` | Cursor | `~/.cursor/mcp.json` | same as Claude Desktop |
+
+Re-running is safe. Only the `butterstack` entry is ever written; every other key and server is left as it was, and an entry that is already correct is not rewritten. A config file that contains comments is never rewritten, because that would delete the comments; the command prints the entry to paste and the file to paste it into instead. `--dry-run` shows what would change without writing anything.
+
+Claude Code registers MCP servers itself:
+
+```
+claude mcp add butterstack -- npx -y butterstack-mcp
+```
+
+See the [MCP guide](https://butterstack.com/docs/guides/mcp) for other clients.
+
 ## Global options
 
 | Flag | Description |
