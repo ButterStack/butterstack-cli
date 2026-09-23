@@ -1,6 +1,6 @@
 {
   "name": "butterstack-cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Fast, scriptable, zero-dependency command line interface for the ButterStack game development pipeline: auth, projects, tasks, builds, and asset approvals.",
   "bin": {
     "butter": "./bin/butter"
