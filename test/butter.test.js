@@ -579,6 +579,117 @@ test("#1938: a server with no investigation key is not reported as 'no investiga
   }
 });
 
+// -- #6: `projects show` was advertised in help but never dispatched ---------
+
+const PROJECT_DETAIL = {
+  id: 108,
+  name: "PilotLight",
+  project_type: "godot",
+  tasks_count: 12,
+  build_runs_count: 34,
+  assets_count: 56,
+  pending_assets_count: 3,
+  latest_build: {
+    id: BUILD_ID,
+    status: "failed",
+    target_type: null,
+    commit_hash: "p4-207",
+    duration: 0.764199,
+    created_at: "2026-09-18T10:55:02-04:00"
+  }
+};
+
+test("#6: `projects show` renders a project instead of failing as an unknown subcommand", async () => {
+  const home = mkHome();
+  const { server, port, requests } = await startApiServer({
+    "GET /api/v1/projects/108": { body: PROJECT_DETAIL }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout, stderr, success } = await runButter(["projects", "show", "108"], { home });
+
+    assert.equal(success, true, `expected success, got stderr: ${stderr}`);
+    assert.ok(!stderr.includes("Unknown subcommand"));
+    assert.ok(stdout.includes("PROJECT 108"), "the project id should be printed");
+    assert.ok(stdout.includes("PilotLight"), "the project name should be printed");
+    assert.ok(stdout.includes("godot"), "the project type should be printed");
+    assert.ok(stdout.includes(BUILD_ID), "the latest build should be printed");
+    assert.ok(stdout.includes("p4-207"), "the latest build's commit should be printed");
+
+    const req = await requests.pop(2000);
+    assert.equal(req.method, "GET");
+    assert.equal(req.url, "/api/v1/projects/108");
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("#6: `projects show` says 'none' when the project has no builds", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    "GET /api/v1/projects/108": { body: { ...PROJECT_DETAIL, latest_build: null } }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout, success } = await runButter(["projects", "show", "108"], { home });
+    assert.equal(success, true);
+    assert.match(stdout, /Latest build:\s+(\x1b\[[0-9;]*m)*none/);
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("#6: `projects show --json` works with the flag on either side of the id", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    "GET /api/v1/projects/108": { body: PROJECT_DETAIL }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+
+    const before = await runButter(["projects", "show", "--json", "108"], { home });
+    assert.equal(before.success, true, `expected success, got stderr: ${before.stderr}`);
+    assert.deepEqual(JSON.parse(before.stdout), PROJECT_DETAIL);
+
+    const after = await runButter(["projects", "show", "108", "--json"], { home });
+    assert.equal(after.success, true, `expected success, got stderr: ${after.stderr}`);
+    assert.deepEqual(JSON.parse(after.stdout), PROJECT_DETAIL);
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("#6: `projects show` without an id prints usage and exits non-zero", async () => {
+  const home = mkHome();
+  try {
+    const { stderr, success } = await runButter(["projects", "show"], { home });
+    assert.equal(success, false);
+    assert.ok(stderr.includes("Usage: butter projects show"));
+  } finally {
+    rmHome(home);
+  }
+});
+
+test("#6: `projects show` for a missing project fails loudly", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    "GET /api/v1/projects/999": { status: 404, body: { error: "Project not found" } }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stderr, success } = await runButter(["projects", "show", "999"], { home });
+    assert.equal(success, false);
+    assert.ok(stderr.includes("Failed to show project"));
+    assert.ok(stderr.includes("Project not found"), "the server's error should be surfaced");
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
 // buildEnv sets BUTTERSTACK_NO_BROWSER for every test; this pins that the
 // binary honors it.
 // Buffers the child's full stdout, so tests can assert on the whole block.
