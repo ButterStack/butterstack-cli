@@ -928,7 +928,8 @@ ${colors.bold}COMMANDS:${colors.reset}
                         Inspect CI/CD builds and AI failure investigations.
                         ${colors.bold}investigate${colors.reset} STARTS a paid AI analysis;
                         ${colors.bold}investigation${colors.reset} reads the result back for free.
-  ${colors.accent}assets${colors.reset} list | show | approve | deny Review and approve textures, models, and audio
+  ${colors.accent}assets${colors.reset} list | approve | deny        Review and approve textures, models, and audio
+                        ${colors.bold}show${colors.reset} is coming soon
 
 ${colors.bold}GLOBAL OPTIONS:${colors.reset}
   --project <id>       Target project ID (e.g. --project 1)
