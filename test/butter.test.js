@@ -859,3 +859,194 @@ test("without the flag, auth login says it is opening a browser and hands it the
     rmHome(home);
   }
 });
+
+// -- #7: MCP client setup ----------------------------------------------------
+//
+// Every `mcp install` case runs against a temp HOME, so no test can touch a
+// real client config.
+
+const { parseJsonc } = require(BUTTER_BIN);
+
+const OPENCODE_ENTRY = { type: "local", command: ["npx", "-y", "butterstack-mcp"], enabled: true };
+const CLAUDE_SHAPE_ENTRY = { command: "npx", args: ["-y", "butterstack-mcp"] };
+
+function opencodeDir(home) {
+  return path.join(home, ".config", "opencode");
+}
+
+test("#7: parseJsonc strips comments and trailing commas, but never inside strings", () => {
+  const text = [
+    "﻿{",
+    "  // a line comment",
+    '  "url": "https://example.com/a//b", /* inline */',
+    '  "glob": "src/**/*.ts",',
+    '  "quote": "say \\"hi\\" // not a comment",',
+    '  "comma": ",}",',
+    '  "list": [1, 2, 3,],',
+    '  "nested": { "a": 1, },',
+    "  /* a",
+    "     block */",
+    "}"
+  ].join("\n");
+  const { value, hadComments } = parseJsonc(text);
+  assert.equal(hadComments, true);
+  assert.deepEqual(value, {
+    url: "https://example.com/a//b",
+    glob: "src/**/*.ts",
+    quote: 'say "hi" // not a comment',
+    comma: ",}",
+    list: [1, 2, 3],
+    nested: { a: 1 }
+  });
+
+  assert.equal(parseJsonc('{"a": [1,],}').hadComments, false, "trailing commas alone are not comments");
+  assert.throws(() => parseJsonc('{"a": 1 /* never closed'), /Unterminated/);
+  assert.throws(() => parseJsonc('{"a": }'), SyntaxError);
+});
+
+test("#7: mcp install fixes a wrong-shaped OpenCode entry, keeps everything else, and is idempotent", async () => {
+  const home = mkHome();
+  try {
+    const file = path.join(opencodeDir(home), "opencode.json");
+    fs.mkdirSync(opencodeDir(home), { recursive: true });
+    // The Claude-shaped entry that makes OpenCode refuse to start.
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        $schema: "https://opencode.ai/config.json",
+        theme: "dark",
+        mcp: { other: { type: "local", command: ["other-mcp"], enabled: true }, butterstack: { command: "butterstack-mcp" } }
+      })
+    );
+
+    const first = await runButter(["mcp", "install", "--opencode"], { home });
+    assert.equal(first.success, true, first.stderr);
+    assert.ok(stripAnsi(first.stdout).includes(file), `the written file should be printed:\n${first.stdout}`);
+
+    const written = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.deepEqual(written.mcp.butterstack, OPENCODE_ENTRY);
+    assert.deepEqual(written.mcp.other, { type: "local", command: ["other-mcp"], enabled: true }, "other servers must survive");
+    assert.equal(written.theme, "dark");
+    assert.equal(written.$schema, "https://opencode.ai/config.json");
+    assert.deepEqual(Object.keys(written.mcp), ["other", "butterstack"], "no duplicate, and the entry stays in place");
+
+    const before = fs.readFileSync(file, "utf-8");
+    const second = await runButter(["mcp", "install", "--opencode"], { home });
+    assert.equal(second.success, true);
+    assert.match(stripAnsi(second.stdout), /OpenCode: already configured/);
+    assert.equal(fs.readFileSync(file, "utf-8"), before, "a re-run must not rewrite the file");
+  } finally {
+    rmHome(home);
+  }
+});
+
+test("#7: mcp install --cursor creates ~/.cursor/mcp.json when it does not exist", async () => {
+  const home = mkHome();
+  try {
+    const file = path.join(home, ".cursor", "mcp.json");
+    const { stdout, success } = await runButter(["mcp", "install", "--cursor"], { home });
+    assert.equal(success, true);
+    assert.ok(stripAnsi(stdout).includes(`created ${file}`), stdout);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf-8")), { mcpServers: { butterstack: CLAUDE_SHAPE_ENTRY } });
+    assert.equal(fs.existsSync(opencodeDir(home)), false, "a client flag limits the install to that client");
+  } finally {
+    rmHome(home);
+  }
+});
+
+test("#7: with no flag, mcp install configures only the clients that are installed", async () => {
+  const home = mkHome();
+  try {
+    fs.mkdirSync(path.join(home, ".cursor"));
+    const { success } = await runButter(["mcp", "install"], { home });
+    assert.equal(success, true);
+    assert.ok(fs.existsSync(path.join(home, ".cursor", "mcp.json")));
+    assert.equal(fs.existsSync(opencodeDir(home)), false, "OpenCode is not installed, so nothing is created for it");
+
+  } finally {
+    rmHome(home);
+  }
+});
+
+test("#7: with no flag and no client installed, mcp install fails loudly", async () => {
+  const home = mkHome();
+  try {
+    const { stderr, success } = await runButter(["mcp", "install"], { home });
+    assert.equal(success, false);
+    assert.match(stderr, /No supported AI client found/);
+  } finally {
+    rmHome(home);
+  }
+});
+
+test("#7: a config with comments is never rewritten; the snippet and path are printed instead", async () => {
+  const home = mkHome();
+  try {
+    const file = path.join(opencodeDir(home), "opencode.jsonc");
+    fs.mkdirSync(opencodeDir(home), { recursive: true });
+    const original = '{\n  // keep me\n  "theme": "dark",\n  "mcp": {},\n}\n';
+    fs.writeFileSync(file, original);
+
+    const { stdout, success } = await runButter(["mcp", "install", "--opencode"], { home });
+    const out = stripAnsi(stdout);
+    assert.equal(success, true, "printing the snippet is a normal outcome, not a failure");
+    assert.equal(fs.readFileSync(file, "utf-8"), original, "the commented file must be left byte-for-byte");
+    assert.ok(out.includes(file), `the path to edit should be printed:\n${out}`);
+    assert.ok(out.includes('inside the existing "mcp" object'), out);
+    assert.ok(out.includes('"type": "local"') && out.includes('"enabled": true'), `the OpenCode shape should be printed:\n${out}`);
+  } finally {
+    rmHome(home);
+  }
+});
+
+test("#7: mcp install --dry-run writes nothing", async () => {
+  const home = mkHome();
+  try {
+    const { stdout, success } = await runButter(["mcp", "install", "--cursor", "--opencode", "--dry-run"], { home });
+    assert.equal(success, true);
+    assert.match(stripAnsi(stdout), /would create .*mcp\.json/);
+    assert.equal(fs.existsSync(path.join(home, ".cursor")), false);
+    assert.equal(fs.existsSync(opencodeDir(home)), false);
+  } finally {
+    rmHome(home);
+  }
+});
+
+async function loginOutput(extraArgs) {
+  const { server, port } = await startFakeExchangeServer(["ping"]);
+  const home = mkHome();
+  try {
+    const child = spawn(
+      process.execPath,
+      [BUTTER_BIN, "auth", "login", "--host", `http://127.0.0.1:${port}`, ...extraArgs],
+      { env: buildEnv({ home }) }
+    );
+    const readOut = captureStdout(child);
+    const parsed = new URL(cleanUrl(await readAuthUrl(child)));
+    await hitCallback(
+      `http://127.0.0.1:${parsed.searchParams.get("port")}/callback?code=c&state=${parsed.searchParams.get("state")}`
+    );
+    const { success } = await waitForExit(child);
+    assert.equal(success, true);
+    return stripAnsi(readOut());
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+}
+
+test("#7: a successful login prints how to connect an AI client", async () => {
+  const out = await loginOutput([]);
+  assert.ok(out.includes("Successfully authenticated"), out);
+  assert.ok(out.includes("Connect your AI client to ButterStack:"), out);
+  assert.ok(out.includes("claude mcp add butterstack -- npx -y butterstack-mcp"), out);
+  assert.ok(out.includes("opencode mcp add butterstack"), out);
+  assert.ok(out.includes("butter mcp install"), out);
+  assert.ok(out.includes("https://butterstack.com/docs/guides/mcp"), out);
+});
+
+test("#7: the MCP hint is skipped under --json", async () => {
+  const out = await loginOutput(["--json"]);
+  assert.ok(out.includes("Successfully authenticated"), out);
+  assert.ok(!out.includes("Connect your AI client"), out);
+});

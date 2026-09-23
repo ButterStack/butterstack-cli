@@ -356,6 +356,7 @@ async function authLogin(args) {
       if (exchange.expires_at) {
         console.log(`${colors.muted}Token expires ${new Date(exchange.expires_at).toLocaleDateString()} -- run ${colors.bold}butter auth login${colors.reset}${colors.muted} again after that to renew.${colors.reset}`);
       }
+      if (!args.json) printMcpHint();
       console.log("");
       process.exit(0);
     } catch (err) {
@@ -862,6 +863,293 @@ async function assetsDeny(args) {
   }
 }
 
+// -- MCP client configuration ------------------------------------------------
+//
+// The ButterStack MCP server (`npx -y butterstack-mcp`) reads the credential
+// `butter auth login` writes, so login is step one of every MCP setup. The
+// clients disagree on the config schema, and the Claude shape pasted into
+// OpenCode makes OpenCode refuse to start, so each client's entry is built
+// here and nowhere else.
+
+const MCP_SERVER_NAME = "butterstack";
+const MCP_PACKAGE = "butterstack-mcp";
+const MCP_DOCS_URL = "https://butterstack.com/docs/guides/mcp";
+
+function printMcpHint() {
+  console.log(`\n${colors.bold}Connect your AI client to ButterStack:${colors.reset}`);
+  console.log(`  Claude Code:  ${colors.accent}claude mcp add ${MCP_SERVER_NAME} -- npx -y ${MCP_PACKAGE}${colors.reset}`);
+  console.log(
+    `  OpenCode:     ${colors.accent}opencode mcp add ${MCP_SERVER_NAME}${colors.reset}   ${colors.muted}(interactive; command: npx -y ${MCP_PACKAGE})${colors.reset}`
+  );
+  console.log(
+    `  Auto-config:  ${colors.accent}butter mcp install${colors.reset}   ${colors.muted}(OpenCode, Claude Desktop, Cursor)${colors.reset}`
+  );
+  console.log(`  Others:       ${MCP_DOCS_URL}`);
+}
+
+// os.homedir() honors $HOME on macOS and Linux, which is what lets the tests
+// point every path below at a throwaway directory.
+function mcpClients() {
+  const home = os.homedir();
+  let claudeDir;
+  if (process.platform === "darwin") {
+    claudeDir = path.join(home, "Library", "Application Support", "Claude");
+  } else if (process.platform === "win32") {
+    claudeDir = path.join(process.env.APPDATA || path.join(home, "AppData", "Roaming"), "Claude");
+  } else {
+    claudeDir = path.join(home, ".config", "Claude");
+  }
+  const opencodeDir = path.join(home, ".config", "opencode");
+  const cursorDir = path.join(home, ".cursor");
+  const claudeShape = { command: "npx", args: ["-y", MCP_PACKAGE] };
+
+  return [
+    {
+      flag: "opencode",
+      name: "OpenCode",
+      dir: opencodeDir,
+      // Either may exist; .jsonc wins when both do. A new file is plain JSON.
+      files: [path.join(opencodeDir, "opencode.jsonc"), path.join(opencodeDir, "opencode.json")],
+      createAs: path.join(opencodeDir, "opencode.json"),
+      key: "mcp",
+      entry: { type: "local", command: ["npx", "-y", MCP_PACKAGE], enabled: true }
+    },
+    {
+      flag: "claude",
+      name: "Claude Desktop",
+      dir: claudeDir,
+      files: [path.join(claudeDir, "claude_desktop_config.json")],
+      createAs: path.join(claudeDir, "claude_desktop_config.json"),
+      key: "mcpServers",
+      entry: claudeShape
+    },
+    {
+      flag: "cursor",
+      name: "Cursor",
+      dir: cursorDir,
+      files: [path.join(cursorDir, "mcp.json")],
+      createAs: path.join(cursorDir, "mcp.json"),
+      key: "mcpServers",
+      entry: claudeShape
+    }
+  ];
+}
+
+// Tolerant JSONC reader: strips // and /* */ comments and trailing commas
+// (never inside strings), then hands the result to JSON.parse. Reports
+// whether any comment was seen, because rewriting such a file would silently
+// delete the user's comments.
+function parseJsonc(text) {
+  const src = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  let hadComments = false;
+
+  // Index just past the string literal that starts at `i`.
+  const skipString = (s, i) => {
+    i++;
+    while (i < s.length && s[i] !== '"') i += s[i] === "\\" ? 2 : 1;
+    return i + 1;
+  };
+
+  let noComments = "";
+  for (let i = 0; i < src.length; ) {
+    const ch = src[i];
+    if (ch === '"') {
+      const end = skipString(src, i);
+      noComments += src.slice(i, end);
+      i = end;
+    } else if (ch === "/" && src[i + 1] === "/") {
+      hadComments = true;
+      while (i < src.length && src[i] !== "\n") i++;
+    } else if (ch === "/" && src[i + 1] === "*") {
+      hadComments = true;
+      const end = src.indexOf("*/", i + 2);
+      if (end === -1) throw new SyntaxError("Unterminated /* comment");
+      noComments += " ";
+      i = end + 2;
+    } else {
+      noComments += ch;
+      i++;
+    }
+  }
+
+  let clean = "";
+  for (let i = 0; i < noComments.length; ) {
+    const ch = noComments[i];
+    if (ch === '"') {
+      const end = skipString(noComments, i);
+      clean += noComments.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < noComments.length && /\s/.test(noComments[j])) j++;
+      if (noComments[j] === "}" || noComments[j] === "]") {
+        i++;
+        continue;
+      }
+    }
+    clean += ch;
+    i++;
+  }
+
+  return { value: JSON.parse(clean), hadComments };
+}
+
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+// Key order means nothing to any client, so it must not make an existing,
+// correct entry look stale.
+function sameJson(a, b) {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => sameJson(v, b[i]));
+  }
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length && keys.every((k) => Object.hasOwn(b, k) && sameJson(a[k], b[k]));
+  }
+  return a === b;
+}
+
+function indent(text, pad) {
+  return text
+    .split("\n")
+    .map((l) => pad + l)
+    .join("\n");
+}
+
+// What to paste by hand. If the file already has the section, only the entry
+// goes inside it; otherwise the whole section goes at the top level.
+function printMcpSnippet(client, data) {
+  const hasSection = isPlainObject(data) && isPlainObject(data[client.key]);
+  const snippet = hasSection
+    ? `"${MCP_SERVER_NAME}": ${JSON.stringify(client.entry, null, 2)}`
+    : `"${client.key}": ${JSON.stringify({ [MCP_SERVER_NAME]: client.entry }, null, 2)}`;
+  const where = hasSection ? `inside the existing "${client.key}" object` : "at the top level";
+  console.log(`  Add this ${where} (with a comma if it is not the last entry):\n`);
+  console.log(indent(snippet, "    "));
+  console.log("");
+}
+
+// Returns "written", "unchanged", "manual" or "error".
+function mcpInstallClient(client, { dryRun }) {
+  const existing = client.files.find((f) => fs.existsSync(f));
+  const file = existing || client.createAs;
+  let data = {};
+  let hadComments = false;
+
+  if (existing) {
+    const text = fs.readFileSync(existing, "utf-8");
+    if (text.trim() !== "") {
+      try {
+        ({ value: data, hadComments } = parseJsonc(text));
+      } catch (err) {
+        console.error(`${colors.err}✗ ${client.name}: could not parse ${file}: ${err.message}${colors.reset}`);
+        console.error(`  Left it untouched. Fix the file, or edit it by hand:`);
+        printMcpSnippet(client, null);
+        return "error";
+      }
+    }
+  }
+
+  if (!isPlainObject(data) || (data[client.key] !== undefined && !isPlainObject(data[client.key]))) {
+    const what = isPlainObject(data) ? `"${client.key}" is not an object` : "the top level is not an object";
+    console.error(`${colors.err}✗ ${client.name}: ${file}: ${what}. Left it untouched.${colors.reset}`);
+    return "error";
+  }
+
+  const section = data[client.key] || {};
+  const previous = section[MCP_SERVER_NAME];
+  if (previous !== undefined && sameJson(previous, client.entry)) {
+    console.log(`${colors.ok}✓ ${client.name}: already configured${colors.reset} ${colors.muted}(${file})${colors.reset}`);
+    return "unchanged";
+  }
+
+  if (hadComments) {
+    console.log(`${colors.warn}! ${client.name}: ${file} contains comments, which a rewrite would delete.${colors.reset}`);
+    printMcpSnippet(client, data);
+    return "manual";
+  }
+
+  // Spreading keeps every other key, and keeps an existing entry in place.
+  const next = { ...data, [client.key]: { ...section, [MCP_SERVER_NAME]: client.entry } };
+
+  if (dryRun) {
+    console.log(`${colors.accent}~ ${client.name}: would ${existing ? "update" : "create"} ${file}${colors.reset}`);
+    console.log(`    ${client.key}.${MCP_SERVER_NAME} = ${JSON.stringify(client.entry)}`);
+    if (previous !== undefined) console.log(`    replacing ${JSON.stringify(previous)}`);
+    return "unchanged";
+  }
+
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(next, null, 2) + "\n");
+  console.log(`${colors.ok}✓ ${client.name}: ${existing ? "updated" : "created"} ${file}${colors.reset}`);
+  if (previous !== undefined) {
+    console.log(`  ${colors.muted}Replaced the previous "${MCP_SERVER_NAME}" entry: ${JSON.stringify(previous)}${colors.reset}`);
+  }
+  return "written";
+}
+
+async function mcpInstall(args) {
+  const clients = mcpClients();
+  const requested = clients.filter((c) => args[c.flag]);
+  const dryRun = Boolean(args["dry-run"]);
+
+  // A client counts as installed when its config directory exists, so a
+  // fresh Cursor install with no mcp.json yet is still picked up.
+  const targets = requested.length ? requested : clients.filter((c) => fs.existsSync(c.dir));
+  if (targets.length === 0) {
+    console.error(`${colors.err}✗ No supported AI client found (looked for OpenCode, Claude Desktop, Cursor).${colors.reset}`);
+    console.error(`Pass --opencode, --claude or --cursor to create a config anyway, or see ${MCP_DOCS_URL}`);
+    process.exit(1);
+  }
+
+  if (dryRun) console.log(`${colors.muted}Dry run: nothing will be written.${colors.reset}`);
+
+  const results = targets.map((c) => ({ client: c, status: mcpInstallClient(c, { dryRun }) }));
+
+  const written = results.filter((r) => r.status === "written").map((r) => r.client.name);
+  if (written.length) {
+    console.log(`\nRestart ${written.join(", ")} to load the ButterStack MCP server.`);
+  }
+  if (!loadCredentials()) {
+    console.log(
+      `${colors.muted}The MCP server uses your CLI login. Run ${colors.bold}butter auth login${colors.reset}${colors.muted} if you have not yet.${colors.reset}`
+    );
+  }
+
+  if (results.some((r) => r.status === "error")) process.exit(1);
+}
+
+function printMcpHelp() {
+  console.log(`
+${colors.accent}${colors.bold}butter mcp${colors.reset}
+Connect AI clients to the ButterStack MCP server (npx -y ${MCP_PACKAGE}).
+
+${colors.bold}USAGE:${colors.reset}
+  butter mcp install [--opencode] [--claude] [--cursor] [--dry-run]
+
+With no client flag, every installed client is configured. A client flag
+limits the install to that client, creating its config file if needed.
+Re-running is safe: only the "${MCP_SERVER_NAME}" entry is ever written.
+
+  --opencode   ~/.config/opencode/opencode.jsonc (or opencode.json)
+  --claude     Claude Desktop's claude_desktop_config.json
+  --cursor     ~/.cursor/mcp.json
+  --dry-run    Show what would change without writing anything
+
+A config file containing comments is never rewritten; the entry to paste
+is printed instead.
+
+Claude Code registers servers itself:
+  claude mcp add ${MCP_SERVER_NAME} -- npx -y ${MCP_PACKAGE}
+
+Docs: ${MCP_DOCS_URL}
+`);
+}
+
 // Flags that are switches, never name/value pairs (#1938).
 //
 // The parser used to treat every `--flag` as taking a value whenever the next
@@ -880,7 +1168,11 @@ const BOOLEAN_FLAGS = new Set([
   "yes",
   "force",
   "no-color",
-  "steps"
+  "steps",
+  "dry-run",
+  "opencode",
+  "claude",
+  "cursor"
 ]);
 
 // `--key=value` is always explicit, so it is honored for any key including
@@ -930,6 +1222,8 @@ ${colors.bold}COMMANDS:${colors.reset}
                         ${colors.bold}investigation${colors.reset} reads the result back for free.
   ${colors.accent}assets${colors.reset} list | approve | deny        Review and approve textures, models, and audio
                         ${colors.bold}show${colors.reset} is coming soon
+  ${colors.accent}mcp${colors.reset} install                     Connect OpenCode, Claude Desktop, and Cursor
+                        to the ButterStack MCP server (see: butter mcp)
 
 ${colors.bold}GLOBAL OPTIONS:${colors.reset}
   --project <id>       Target project ID (e.g. --project 1)
@@ -955,6 +1249,10 @@ async function main() {
   const cmd = args._[0];
   const subcmd = args._[1];
 
+  if ((args.help || args.h) && cmd === "mcp") {
+    printMcpHelp();
+    return;
+  }
   if (args.help || args.h || !cmd) {
     printHelp();
     return;
@@ -989,6 +1287,10 @@ async function main() {
       if (subcmd === "approve") return assetsApprove(args);
       if (subcmd === "deny") return assetsDeny(args);
       break;
+    case "mcp":
+      if (!subcmd) return printMcpHelp();
+      if (subcmd === "install") return mcpInstall(args);
+      break;
     default:
       console.error(`${colors.err}Unknown command: ${cmd}${colors.reset}`);
       printHelp();
@@ -1012,4 +1314,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { request, loadCredentials, saveCredentials, getHost };
+module.exports = { request, loadCredentials, saveCredentials, getHost, parseJsonc };
