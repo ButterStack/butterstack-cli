@@ -449,6 +449,49 @@ async function projectsList(args) {
   }
 }
 
+async function projectsShow(args) {
+  const projectId = args._[2];
+  if (!projectId) {
+    console.error(`${colors.err}✗ Usage: butter projects show <project_id>${colors.reset}`);
+    process.exit(1);
+  }
+
+  try {
+    const res = await request("GET", `/api/v1/projects/${projectId}`);
+    if (args.json) {
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+
+    console.log(`\n${colors.bold}PROJECT ${res.id}${colors.reset}`);
+    console.log("----------------------------------------------------------------------");
+    console.log(`  Name:          ${colors.accent}${res.name || "-"}${colors.reset}`);
+    console.log(`  Type:          ${res.project_type || "-"}`);
+    console.log(`  Tasks:         ${res.tasks_count != null ? res.tasks_count : "-"}`);
+    console.log(`  Builds:        ${res.build_runs_count != null ? res.build_runs_count : "-"}`);
+    console.log(`  Assets:        ${res.assets_count != null ? res.assets_count : "-"}`);
+    if (res.pending_assets_count != null) {
+      console.log(`  Pending:       ${res.pending_assets_count} asset(s) awaiting approval`);
+    }
+
+    const b = res.latest_build;
+    if (b) {
+      const statusColor =
+        b.status === "completed" ? colors.ok : b.status === "failed" ? colors.err : colors.warn;
+      const parts = [b.id, `${statusColor}${b.status}${colors.reset}`];
+      if (b.target_type) parts.push(b.target_type);
+      if (b.commit_hash) parts.push(String(b.commit_hash).slice(0, 8));
+      console.log(`  Latest build:  ${parts.join("  ")}`);
+    } else {
+      console.log(`  Latest build:  ${colors.muted}none${colors.reset}`);
+    }
+    console.log("");
+  } catch (err) {
+    console.error(`${colors.err}✗ Failed to show project: ${err.message}${colors.reset}`);
+    process.exit(1);
+  }
+}
+
 async function tasksList(args) {
   const projectId = args.project || loadConfig().defaultProject;
   if (!projectId) {
@@ -885,7 +928,8 @@ ${colors.bold}COMMANDS:${colors.reset}
                         Inspect CI/CD builds and AI failure investigations.
                         ${colors.bold}investigate${colors.reset} STARTS a paid AI analysis;
                         ${colors.bold}investigation${colors.reset} reads the result back for free.
-  ${colors.accent}assets${colors.reset} list | show | approve | deny Review and approve textures, models, and audio
+  ${colors.accent}assets${colors.reset} list | approve | deny        Review and approve textures, models, and audio
+                        ${colors.bold}show${colors.reset} is coming soon
 
 ${colors.bold}GLOBAL OPTIONS:${colors.reset}
   --project <id>       Target project ID (e.g. --project 1)
@@ -925,6 +969,7 @@ async function main() {
     case "projects":
     case "project":
       if (subcmd === "list" || !subcmd) return projectsList(args);
+      if (subcmd === "show") return projectsShow(args);
       break;
     case "tasks":
     case "task":
