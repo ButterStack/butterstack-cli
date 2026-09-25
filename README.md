@@ -67,10 +67,26 @@ butter tasks create "<title>" --project <id> [--type <type>] [--priority <priori
 
 ```
 butter builds list --project <id> [--status <status>] [--type <type>] [--limit <n>] [--json]
+butter builds show <build_id> --project <id> [--json]
 butter builds investigate <build_id> --project <id> [--json]
 ```
 
 `builds investigate` triggers an AI failure investigation on a build run and prints the diagnosis and suggested fix.
+
+### Changes
+
+Commits and changelists across the git, Perforce, and Lore rails.
+
+```
+butter changes list --project <id> [--source lore|git|perforce] [--since <date>] [--identifier <id>] [--orphaned] [--limit <n>] [--after <cursor>] [--json]
+butter changes show <change_id|commit> --project <id> [--json]
+```
+
+`changes show` takes either the change id that `changes list` prints, or a commit reference: a full git SHA, a Perforce build's `p4-<n>`, or a Lore `lore-<n>`. That is how a build's commit (the `Commit:` line of `builds show`) is resolved to the change it belongs to. Matching is exact, so short SHAs do not resolve. An all-digit argument is always read as a change id; to look up a bare Perforce changelist number use `changes list --identifier <n>`.
+
+`lore` and `perforce` share one type server-side and are split on this side, so a filtered page can hold fewer than `--limit` rows. `changes list` prints the `--after` value for the next page when there is one; `--json` returns the whole `{changes, pagination}` envelope. Orphaned (ghost) commits are excluded unless you pass `--orphaned`.
+
+These commands need the `read:changes` scope. Tokens issued before it was added to the CLI scope set do not carry it and get a `403 insufficient_scope`: run `butter auth login` again to reissue.
 
 ### Assets
 

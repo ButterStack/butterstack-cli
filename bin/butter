@@ -223,7 +223,7 @@ function request(method, endpoint, body = null, tokenOverride = null, opts = {})
 // raw comma/space-separated permission list directly (passed through
 // as-is, validated server-side against the CLI-eligible scope set).
 const SCOPE_PRESETS = {
-  "read-only": "read:projects read:tasks read:builds read:assets",
+  "read-only": "read:projects read:tasks read:builds read:assets read:changes",
   full: "" // empty scope param -> server defaults to the full CLI set
 };
 
@@ -615,6 +615,9 @@ async function buildsShow(args) {
     console.log(`  Overall:       ${res.overall_status || "-"}`);
     console.log(`  Job:           ${res.ci_job_name || "-"}`);
     console.log(`  Commit:        ${res.commit_hash || "-"}`);
+    if (res.commit_hash) {
+      console.log(`  Change:        ${colors.muted}butter changes show ${res.commit_hash} --project ${projectId}${colors.reset}`);
+    }
     console.log(`  Type:          ${res.build_type || "-"}${res.target_type ? ` / ${res.target_type}` : ""}`);
     console.log(`  Duration:      ${res.duration != null ? `${res.duration}s` : "-"}`);
     console.log(`  Created:       ${res.created_at || "-"}`);
@@ -778,6 +781,201 @@ async function buildsInvestigate(args) {
   } catch (err) {
     console.error(`${colors.err}✗ Failed to investigate build: ${err.message}${colors.reset}`);
     process.exit(1);
+  }
+}
+
+// -- Changes: commits and changelists across the git, Perforce and Lore rails --
+
+// Friendly --source names mapped onto the API's source_type. Lore and
+// Perforce share source_type "Changelist", so those two are split by
+// identifier on this side: Lore changelists are namespaced "lore-<n>",
+// Perforce ones are bare numbers. The raw API values are accepted as-is.
+const CHANGE_SOURCES = {
+  git: { sourceType: "GitCommit" },
+  perforce: { sourceType: "Changelist", keep: (c) => c.source_type === "Changelist" && !String(c.identifier).startsWith("lore-") },
+  lore: { sourceType: "Changelist", keep: (c) => c.source_type === "Changelist" && String(c.identifier).startsWith("lore-") },
+  GitCommit: { sourceType: "GitCommit" },
+  AssetCommit: { sourceType: "AssetCommit" },
+  Changelist: { sourceType: "Changelist" }
+};
+
+function changeSourceLabel(c) {
+  if (c.source_type === "GitCommit") return "git";
+  if (c.source_type === "AssetCommit") return "asset";
+  if (c.source_type === "Changelist") return String(c.identifier).startsWith("lore-") ? "lore" : "perforce";
+  return c.source_type || "-";
+}
+
+// A BuildRun's commit_hash is not always a Change identifier verbatim: a
+// Perforce build stores "p4-<n>" while its Change stores the bare "<n>".
+// The identifier filter is exact and never validated, so passing "p4-207"
+// through unchanged returns an empty list rather than an error.
+function changeLookupFor(ref) {
+  const m = /^p4-(\d+)$/.exec(ref);
+  if (m) return { identifier: m[1], sourceType: "Changelist" };
+  return { identifier: ref, sourceType: null };
+}
+
+function reportChangesError(action, err) {
+  console.error(`${colors.err}✗ Failed to ${action}: ${err.message}${colors.reset}`);
+  const body = err.response;
+  if (err.statusCode === 403 && body && body.required_scope === "read:changes") {
+    console.error(
+      `${colors.muted}  This token does not carry read:changes. Tokens issued before the changes commands shipped never got it: run \`butter auth login\` again to reissue.${colors.reset}`
+    );
+  }
+  process.exit(1);
+}
+
+async function changesList(args) {
+  const projectId = args.project || loadConfig().defaultProject;
+  if (!projectId) {
+    console.error(`${colors.err}✗ Missing project ID. Use --project <id>${colors.reset}`);
+    process.exit(1);
+  }
+
+  const query = new URLSearchParams();
+  let keep = null;
+  if (args.source) {
+    const source = CHANGE_SOURCES[args.source];
+    if (!source) {
+      console.error(`${colors.err}✗ Unknown --source "${args.source}". Use lore, git, or perforce.${colors.reset}`);
+      process.exit(1);
+    }
+    query.set("source_type", source.sourceType);
+    keep = source.keep || null;
+  }
+  if (args.identifier) {
+    const lookup = changeLookupFor(String(args.identifier));
+    query.set("identifier", lookup.identifier);
+    if (lookup.sourceType && !args.source) query.set("source_type", lookup.sourceType);
+  }
+  if (args.since) query.set("updated_since", args.since);
+  if (args.orphaned) query.set("orphaned", "true");
+  if (args.limit) query.set("limit", args.limit);
+  // --after, not --cursor: `--cursor` is already the boolean client flag of
+  // `butter mcp install`, so it can never carry a value.
+  if (typeof args.after === "string") query.set("cursor", args.after);
+
+  try {
+    const res = await request("GET", `/api/v1/projects/${projectId}/changes?${query.toString()}`);
+    const changes = keep ? res.changes.filter(keep) : res.changes;
+    if (args.json) {
+      // The whole envelope, not just the array: without pagination a script
+      // has no next_cursor to fetch the page after this one.
+      console.log(JSON.stringify({ changes, pagination: res.pagination }, null, 2));
+      return;
+    }
+    console.log(`\n${colors.bold}CHANGES for Project #${projectId} (${changes.length})${colors.reset}`);
+    console.log("----------------------------------------------------------------------");
+    changes.forEach((c) => {
+      const summary = String(c.description || "").split("\n")[0];
+      const orphaned = c.orphaned_at ? ` ${colors.warn}(orphaned)${colors.reset}` : "";
+      console.log(
+        `  Change #${c.id.toString().padEnd(6)} ${colors.accent}[${changeSourceLabel(c)}]${colors.reset} ${c.display_identifier || c.identifier} ${colors.muted}${c.author || "-"}${colors.reset} ${summary}${orphaned}`
+      );
+    });
+    if (res.pagination && res.pagination.has_more && res.pagination.next_cursor) {
+      console.log(
+        `\n  ${colors.muted}More: butter changes list --project ${projectId} --after ${res.pagination.next_cursor}${colors.reset}`
+      );
+    }
+    console.log("");
+  } catch (err) {
+    reportChangesError("list changes", err);
+  }
+}
+
+async function changesShow(args) {
+  const projectId = args.project || loadConfig().defaultProject;
+  const ref = args._[2] !== undefined ? String(args._[2]) : null;
+  if (!projectId || !ref) {
+    console.error(`${colors.err}✗ Usage: butter changes show <change_id|commit> --project <id>${colors.reset}`);
+    process.exit(1);
+  }
+
+  try {
+    // An all-digit ref is the change id that `changes list` prints. Anything
+    // else is a commit reference (a git SHA, a build's p4-<n>, a lore-<n>),
+    // resolved through the exact-match identifier filter first.
+    let changeId = ref;
+    if (!/^\d+$/.test(ref)) {
+      const lookup = changeLookupFor(ref);
+      const query = new URLSearchParams({ identifier: lookup.identifier, orphaned: "true" });
+      if (lookup.sourceType) query.set("source_type", lookup.sourceType);
+      const found = await request("GET", `/api/v1/projects/${projectId}/changes?${query.toString()}`);
+      if (!found.changes || found.changes.length === 0) {
+        console.error(`${colors.err}✗ No change with identifier "${lookup.identifier}" in project ${projectId}.${colors.reset}`);
+        console.error(
+          `${colors.muted}  The match is exact: use the full commit SHA, a Perforce build's p4-<n>, or lore-<n>. A bare Perforce changelist number is read as a change id; use: butter changes list --project ${projectId} --identifier <n>${colors.reset}`
+        );
+        process.exit(1);
+      }
+      changeId = found.changes[0].id;
+    }
+
+    const res = await request("GET", `/api/v1/projects/${projectId}/changes/${changeId}`);
+    if (args.json) {
+      console.log(JSON.stringify(res, null, 2));
+      return;
+    }
+
+    console.log(`\n${colors.bold}CHANGE ${res.id}${colors.reset}`);
+    console.log("----------------------------------------------------------------------");
+    console.log(`  Identifier:    ${colors.accent}${res.identifier || "-"}${colors.reset}`);
+    console.log(`  Source:        ${changeSourceLabel(res)} (${res.source_type || "-"})`);
+    console.log(`  Author:        ${res.author || "-"}`);
+    console.log(`  Timestamp:     ${res.timestamp || "-"}`);
+    if (res.orphaned_at) {
+      console.log(`  Orphaned:      ${colors.warn}${res.orphaned_at}${colors.reset}`);
+    }
+    if (res.files_available === false) {
+      console.log(`  Files:         ${colors.muted}not available for this change${colors.reset}`);
+    } else {
+      console.log(`  Files:         ${res.file_count != null ? res.file_count : Array.isArray(res.files) ? res.files.length : "-"}`);
+    }
+    const a = res.approvals;
+    if (a) {
+      console.log(`  Approvals:     ${a.approved} approved, ${a.pending} pending, ${a.denied} denied, ${a.ignored} ignored`);
+    }
+    const tasks = Array.isArray(res.task_ids) && res.task_ids.length ? res.task_ids.map((id) => `#${id}`).join(", ") : "none";
+    console.log(`  Tasks:         ${tasks}`);
+
+    const b = res.latest_build;
+    if (b) {
+      const statusColor = b.status === "completed" ? colors.ok : b.status === "failed" ? colors.err : colors.warn;
+      console.log(`  Latest build:  ${b.id}  ${statusColor}${b.status}${colors.reset}${b.ci_job_name ? `  ${b.ci_job_name}` : ""}`);
+    } else {
+      console.log(`  Latest build:  ${colors.muted}none${colors.reset}`);
+    }
+
+    if (res.description) {
+      console.log(`\n${colors.bold}  Description:${colors.reset}`);
+      String(res.description)
+        .trimEnd()
+        .split("\n")
+        .forEach((line) => console.log(`    ${line}`));
+    }
+
+    if (Array.isArray(res.build_runs) && res.build_runs.length) {
+      console.log(`\n${colors.bold}  Builds (${res.build_runs.length}):${colors.reset}`);
+      res.build_runs.forEach((br) => {
+        const c = br.status === "completed" ? colors.ok : br.status === "failed" ? colors.err : colors.warn;
+        console.log(`    ${br.id} ${c}[${br.status}]${colors.reset} ${br.ci_job_name || ""} ${colors.muted}${br.commit_hash || ""}${colors.reset}`);
+      });
+    }
+
+    if (Array.isArray(res.files) && res.files.length) {
+      const shown = res.files.slice(0, 20);
+      console.log(`\n${colors.bold}  Files (${res.files.length}):${colors.reset}`);
+      shown.forEach((f) => console.log(`    ${colors.muted}${(f.action || "").padEnd(8)}${colors.reset} ${f.path || "-"}`));
+      if (res.files.length > shown.length) {
+        console.log(`    ${colors.muted}... and ${res.files.length - shown.length} more (use --json for all)${colors.reset}`);
+      }
+    }
+    console.log("");
+  } catch (err) {
+    reportChangesError("show change", err);
   }
 }
 
@@ -1172,7 +1370,8 @@ const BOOLEAN_FLAGS = new Set([
   "dry-run",
   "opencode",
   "claude",
-  "cursor"
+  "cursor",
+  "orphaned"
 ]);
 
 // `--key=value` is always explicit, so it is honored for any key including
@@ -1220,6 +1419,11 @@ ${colors.bold}COMMANDS:${colors.reset}
                         Inspect CI/CD builds and AI failure investigations.
                         ${colors.bold}investigate${colors.reset} STARTS a paid AI analysis;
                         ${colors.bold}investigation${colors.reset} reads the result back for free.
+  ${colors.accent}changes${colors.reset} list | show <id|commit>   Commits and changelists (git, Perforce, Lore).
+                        ${colors.bold}show${colors.reset} takes a change id, or a build's commit
+                        (SHA, p4-<n>, lore-<n>) to find the change it belongs to.
+                        list filters: --source lore|git|perforce, --since <date>,
+                        --identifier <x>, --orphaned, --limit <n>, --after <cursor>
   ${colors.accent}assets${colors.reset} list | approve | deny        Review and approve textures, models, and audio
                         ${colors.bold}show${colors.reset} is coming soon
   ${colors.accent}mcp${colors.reset} install                     Connect OpenCode, Claude Desktop, and Cursor
@@ -1240,6 +1444,8 @@ ${colors.bold}AUTH OPTIONS:${colors.reset}
 
 Tokens expire 90 days after issue; ${colors.bold}butter auth whoami${colors.reset} shows the
 remaining lifetime and ${colors.bold}butter auth login${colors.reset} again renews it.
+The ${colors.bold}changes${colors.reset} commands need the read:changes scope; a token issued before
+they shipped does not have it, so run ${colors.bold}butter auth login${colors.reset} again once.
 `);
 }
 
@@ -1280,6 +1486,11 @@ async function main() {
       if (subcmd === "show") return buildsShow(args);
       if (subcmd === "investigate") return buildsInvestigate(args);
       if (subcmd === "investigation") return buildsInvestigation(args);
+      break;
+    case "changes":
+    case "change":
+      if (subcmd === "list" || !subcmd) return changesList(args);
+      if (subcmd === "show") return changesShow(args);
       break;
     case "assets":
     case "asset":
