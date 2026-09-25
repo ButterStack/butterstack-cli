@@ -709,6 +709,313 @@ function cleanUrl(u) {
   return stripAnsi(u);
 }
 
+// -- changes: the read path for commits and changelists ----------------------
+//
+// The changes API existed with no client. A build carries a commit_hash, and
+// these commands are how that hash is resolved to the change it belongs to
+// without the web UI.
+
+const GIT_SHA = "3f9c2a7be41d5e6f7a8b9c0d1e2f3a4b5c6d7e8f";
+
+const CHANGES_PAGE = {
+  changes: [
+    {
+      id: 456,
+      identifier: "207",
+      display_identifier: "#207",
+      source_type: "Changelist",
+      author: "jdoe",
+      description: "Fix spawn timing\n\nLonger body",
+      timestamp: "2026-09-18T10:50:00Z",
+      orphaned_at: null,
+      file_count: 3,
+      approval_count: 1
+    },
+    {
+      id: 457,
+      identifier: "lore-12",
+      display_identifier: "lore-12",
+      source_type: "Changelist",
+      author: "asmith",
+      description: "Lore revision",
+      timestamp: "2026-09-18T11:00:00Z",
+      orphaned_at: null,
+      file_count: 1,
+      approval_count: 0
+    },
+    {
+      id: 458,
+      identifier: GIT_SHA,
+      display_identifier: "3f9c2a7",
+      source_type: "GitCommit",
+      author: "kdev",
+      description: "Ghost commit",
+      timestamp: "2026-09-18T12:00:00Z",
+      orphaned_at: "2026-09-19T00:00:00Z",
+      file_count: null,
+      approval_count: 0
+    }
+  ],
+  pagination: { limit: 20, has_more: true, next_cursor: "CURSOR123" }
+};
+
+const CHANGE_DETAIL = {
+  ...CHANGES_PAGE.changes[0],
+  files: [{ path: "//depot/Game/main.gd", action: "edit" }],
+  files_available: true,
+  approvals: { pending: 0, approved: 1, denied: 0, ignored: 0 },
+  build_runs: [{ id: BUILD_ID, status: "failed", commit_hash: "p4-207", ci_job_name: "PilotLight_Verify" }],
+  latest_build: { id: BUILD_ID, status: "failed", commit_hash: "p4-207", ci_job_name: "PilotLight_Verify" },
+  task_ids: [12]
+};
+
+test("changes: `changes list` renders a project's changes and says how to get the next page", async () => {
+  const home = mkHome();
+  const { server, port, requests } = await startApiServer({
+    "GET /api/v1/projects/108/changes": { body: CHANGES_PAGE }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout, stderr, success } = await runButter(["changes", "list", "--project", "108"], { home });
+
+    assert.equal(success, true, `expected success, got stderr: ${stderr}`);
+    const out = stripAnsi(stdout);
+    assert.ok(out.includes("CHANGES for Project #108 (3)"));
+    assert.match(out, /Change #456\s+\[perforce\] #207 jdoe Fix spawn timing/);
+    assert.ok(!out.includes("Longer body"), "only the first line of the description belongs in the list");
+    assert.match(out, /\[lore\] lore-12/);
+    assert.match(out, /\[git\] 3f9c2a7 kdev Ghost commit \(orphaned\)/);
+    assert.ok(out.includes("--after CURSOR123"), "a caller needs the cursor to reach the next page");
+
+    const req = await requests.pop(2000);
+    assert.equal(req.url, "/api/v1/projects/108/changes");
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("changes: `changes list` maps its flags onto the API's query params", async () => {
+  const home = mkHome();
+  const { server, port, requests } = await startApiServer({
+    "GET /api/v1/projects/108/changes": { body: CHANGES_PAGE }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { success } = await runButter(
+      ["changes", "list", "--project", "108", "--source", "git", "--since", "2026-09-01", "--limit", "5", "--orphaned", "--after", "abc"],
+      { home }
+    );
+    assert.equal(success, true);
+
+    const req = await requests.pop(2000);
+    const params = new URL(req.url, "http://x").searchParams;
+    assert.equal(params.get("source_type"), "GitCommit");
+    assert.equal(params.get("updated_since"), "2026-09-01");
+    assert.equal(params.get("limit"), "5");
+    assert.equal(params.get("orphaned"), "true");
+    assert.equal(params.get("cursor"), "abc");
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("changes: --source lore and --source perforce split the shared Changelist type", async () => {
+  const home = mkHome();
+  const { server, port, requests } = await startApiServer({
+    "GET /api/v1/projects/108/changes": { body: CHANGES_PAGE }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+
+    const lore = await runButter(["changes", "list", "--project", "108", "--source", "lore", "--json"], { home });
+    assert.equal(lore.success, true);
+    assert.deepEqual(JSON.parse(lore.stdout).changes.map((c) => c.id), [457]);
+    const loreReq = await requests.pop(2000);
+    assert.equal(new URL(loreReq.url, "http://x").searchParams.get("source_type"), "Changelist");
+
+    const p4 = await runButter(["changes", "list", "--project", "108", "--source", "perforce", "--json"], { home });
+    assert.equal(p4.success, true);
+    assert.deepEqual(JSON.parse(p4.stdout).changes.map((c) => c.id), [456]);
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("changes: `changes list --json` keeps the pagination envelope", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    "GET /api/v1/projects/108/changes": { body: CHANGES_PAGE }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout, success } = await runButter(["changes", "list", "--json", "--project", "108"], { home });
+    assert.equal(success, true);
+    assert.deepEqual(JSON.parse(stdout), CHANGES_PAGE);
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("changes: an unknown --source fails loudly and sends nothing", async () => {
+  const home = mkHome();
+  const { server, port, requests } = await startApiServer({});
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stderr, success } = await runButter(["changes", "list", "--project", "108", "--source", "svn"], { home });
+    assert.equal(success, false);
+    assert.ok(stderr.includes('Unknown --source "svn"'));
+    assert.equal(await requests.pop(200), null, "no request should be sent for a bad flag");
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("changes: `changes show <id>` renders one change with its builds and files", async () => {
+  const home = mkHome();
+  const { server, port, requests } = await startApiServer({
+    "GET /api/v1/projects/108/changes/456": { body: CHANGE_DETAIL }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout, stderr, success } = await runButter(["changes", "show", "456", "--project", "108"], { home });
+
+    assert.equal(success, true, `expected success, got stderr: ${stderr}`);
+    const out = stripAnsi(stdout);
+    assert.ok(out.includes("CHANGE 456"));
+    assert.match(out, /Identifier:\s+207/);
+    assert.match(out, /Source:\s+perforce \(Changelist\)/);
+    assert.match(out, /Approvals:\s+1 approved, 0 pending/);
+    assert.match(out, /Tasks:\s+#12/);
+    assert.ok(out.includes("Longer body"), "the full description belongs on the detail view");
+    assert.ok(out.includes(BUILD_ID), "linked builds should be listed");
+    assert.ok(out.includes("//depot/Game/main.gd"), "files should be listed");
+
+    const req = await requests.pop(2000);
+    assert.equal(req.url, "/api/v1/projects/108/changes/456");
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("changes: `changes show p4-<n>` resolves a Perforce build's commit to its change", async () => {
+  const home = mkHome();
+  const { server, port, requests } = await startApiServer({
+    "GET /api/v1/projects/108/changes": { body: { changes: [CHANGES_PAGE.changes[0]], pagination: { has_more: false } } },
+    "GET /api/v1/projects/108/changes/456": { body: CHANGE_DETAIL }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout, stderr, success } = await runButter(["changes", "show", "p4-207", "--project", "108"], { home });
+    assert.equal(success, true, `expected success, got stderr: ${stderr}`);
+    assert.ok(stripAnsi(stdout).includes("CHANGE 456"));
+
+    // The change stores the bare number, so "p4-207" verbatim would match nothing.
+    const lookup = await requests.pop(2000);
+    const params = new URL(lookup.url, "http://x").searchParams;
+    assert.equal(params.get("identifier"), "207");
+    assert.equal(params.get("source_type"), "Changelist");
+    assert.equal(params.get("orphaned"), "true", "a build's commit can belong to an orphaned change");
+
+    const detail = await requests.pop(2000);
+    assert.equal(detail.url, "/api/v1/projects/108/changes/456");
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("changes: `changes show <sha> --json` resolves a git commit and prints the detail", async () => {
+  const home = mkHome();
+  const gitDetail = { ...CHANGE_DETAIL, id: 458, identifier: GIT_SHA, source_type: "GitCommit" };
+  const { server, port, requests } = await startApiServer({
+    "GET /api/v1/projects/108/changes": { body: { changes: [CHANGES_PAGE.changes[2]], pagination: { has_more: false } } },
+    "GET /api/v1/projects/108/changes/458": { body: gitDetail }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout, success } = await runButter(["changes", "show", "--json", GIT_SHA, "--project", "108"], { home });
+    assert.equal(success, true);
+    assert.deepEqual(JSON.parse(stdout), gitDetail);
+
+    const lookup = await requests.pop(2000);
+    const params = new URL(lookup.url, "http://x").searchParams;
+    assert.equal(params.get("identifier"), GIT_SHA);
+    assert.equal(params.get("source_type"), null);
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("changes: a commit with no matching change fails loudly instead of printing nothing", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    "GET /api/v1/projects/108/changes": { body: { changes: [], pagination: { has_more: false } } }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stderr, success } = await runButter(["changes", "show", "deadbeef", "--project", "108"], { home });
+    assert.equal(success, false);
+    assert.ok(stderr.includes('No change with identifier "deadbeef" in project 108'));
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("changes: a token without read:changes is told to log in again", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    "GET /api/v1/projects/108/changes": {
+      status: 403,
+      body: { error: "insufficient_scope", required_scope: "read:changes", token_scopes: ["read:builds"] }
+    }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stderr, success } = await runButter(["changes", "list", "--project", "108"], { home });
+    assert.equal(success, false);
+    assert.ok(stderr.includes("insufficient_scope"));
+    assert.ok(stderr.includes("butter auth login"), "the fix for an old token should be named");
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
+test("changes: `changes show` without an id prints usage and exits non-zero", async () => {
+  const home = mkHome();
+  try {
+    const { stderr, success } = await runButter(["changes", "show", "--project", "108"], { home });
+    assert.equal(success, false);
+    assert.ok(stderr.includes("Usage: butter changes show"));
+  } finally {
+    rmHome(home);
+  }
+});
+
+test("changes: `builds show` points at the change for the build's commit", async () => {
+  const home = mkHome();
+  const { server, port } = await startApiServer({
+    [`GET /api/v1/projects/108/build_runs/${BUILD_ID}`]: { body: BUILD_DETAIL }
+  });
+  try {
+    writeCredentials(home, { host: `http://127.0.0.1:${port}` });
+    const { stdout, success } = await runButter(["builds", "show", BUILD_ID, "--project", "108"], { home });
+    assert.equal(success, true);
+    assert.ok(stripAnsi(stdout).includes("butter changes show p4-207 --project 108"));
+  } finally {
+    await stopCaptureServer(server);
+    rmHome(home);
+  }
+});
+
 test("auth login prints the URL exactly once, and does not claim to open a browser", async () => {
   const home = mkHome();
   const { server, port } = await startCaptureServer();
